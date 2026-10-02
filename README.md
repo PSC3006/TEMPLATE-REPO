@@ -6,7 +6,7 @@ Windows 11 Enterprise (Single-/Multi-Session) 24H2, 25H2 und 26H2 auf Deutschlan
 
 | Datei | Zweck |
 |---|---|
-| `Install-DE_V8.ps1` | **Das eine Script** (Version 8.0.0): Modes Auto/Install/ReapplyLcu/Validate/PreSysprep sowie CreateRepository (Repository Stufe 2) und ExitCodeTest |
+| `Install-DE_V8.ps1` | **Das eine Script** (Version 8.0.1): Modes Auto/Install/ReapplyLcu/Validate/PreSysprep sowie CreateRepository (Repository Stufe 2) und ExitCodeTest |
 | `tests/Install-DE_V8.Tests.ps1` | Pester-Tests (Pester 4.10/5.x) nur mit Mocks, keine Systemaufrufe |
 | `PSScriptAnalyzerSettings.psd1` | Analyzer-Regeln inkl. Kompatibilität Windows PowerShell 5.1 |
 | `TESTPLAN.md` | Testplan für Marketplace-VMs 24H2/25H2/26H2 |
@@ -297,4 +297,4 @@ Invoke-ScriptAnalyzer -Path .\tests -Settings .\tests\PSScriptAnalyzerSettings.T
 Invoke-Pester -Script .\tests     # Pester 4.10 oder 5.x
 ```
 
-Ergebnis (2026-10-02): Parser 0 Fehler; PSScriptAnalyzer 0 Funde (`Install-DE_V8.ps1` und Tests); Pester 82/82 bestanden. Alle `.ps1` sind reines ASCII (Windows PowerShell 5.1 liest Dateien ohne BOM als ANSI).
+Ergebnis (2026-10-02): Parser 0 Fehler; PSScriptAnalyzer 0 Funde (`Install-DE_V8.ps1` und Tests); Pester 85/85 bestanden. Alle `.ps1` sind reines ASCII (Windows PowerShell 5.1 liest Dateien ohne BOM als ANSI).

@@ -199,10 +199,13 @@
 
 .NOTES
     Datei   : Install-DE_V8.ps1
-    Version : 8.0.0 (2026-10-02)
+    Version : 8.0.1 (2026-10-02)
     Autor   : CDT
 
     CHANGELOG
+      8.0.1  2026-10-02  Erkenntnisse aus dem ersten Testlauf: ohne Adminrechte sauberer Abbruch ohne Folgefehler
+                         (keine Compliance-/Zustandszugriffe), OS-Anzeige "Windows 11" statt Registry-Wert
+                         "Windows 10", SYSTEM-Hinweis nur noch bei Adminrechten.
       8.0.0  2026-10-02  Ein Script fuer alles: Repository-Erstellung (Mode CreateRepository) und Exit-Code-Test
                          (Mode ExitCodeTest) integriert, ersetzt New-CDTLanguageRepository.ps1 und
                          Test-CDTExitCodeHandling.ps1. Dateiname Install-DE_V8.ps1, Version an Dateiname angeglichen.
@@ -378,7 +381,7 @@ $script:ParamSnapshot = @{
 }
 
 #region Konstanten und Laufzeitstatus
-$script:ScriptVersion = '8.0.0'
+$script:ScriptVersion = '8.0.1'
 $script:ScriptBaseName = 'CDT-STANDARD-Install_DE-Language'
 $script:RunStart = Get-Date
 $script:RunTimestamp = $script:RunStart.ToString('yyyy-MM-dd_HHmmss')
@@ -1158,13 +1161,16 @@ function Get-CDTOsInfo {
     $cv = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
     $build = [int](Get-CDTRegistryValue -Path $cv -Name 'CurrentBuildNumber' -Default '0')
     $ubr = [int](Get-CDTRegistryValue -Path $cv -Name 'UBR' -Default 0)
+    # Windows 11 meldet in der Registry weiterhin "Windows 10 ..." als ProductName (Build >= 22000 = Windows 11)
+    $productName = [string](Get-CDTRegistryValue -Path $cv -Name 'ProductName' -Default '')
+    if ($build -ge 22000 -and $productName -match '^Windows 10\b') { $productName = 'Windows 11' + $productName.Substring(10) }
     return [pscustomobject]@{
         Build            = $build
         Ubr              = $ubr
         BuildUbr         = ('{0}.{1}' -f $build, $ubr)
         DisplayVersion   = [string](Get-CDTRegistryValue -Path $cv -Name 'DisplayVersion' -Default '')
         EditionId        = [string](Get-CDTRegistryValue -Path $cv -Name 'EditionID' -Default '')
-        ProductName      = [string](Get-CDTRegistryValue -Path $cv -Name 'ProductName' -Default '')
+        ProductName      = $productName
         InstallationType = [string](Get-CDTRegistryValue -Path $cv -Name 'InstallationType' -Default '')
     }
 }
@@ -1257,13 +1263,15 @@ function Test-CDTPrerequisite {
     $ctx = Get-CDTExecutionContext
     Write-CDTLog -Message ('Kontext: {0} ({1}), Admin={2}, 64-Bit={3}, PowerShell {4} {5}' -f $ctx.User, $ctx.Sid, $ctx.IsAdmin, $ctx.Is64BitProcess, $ctx.PSVersion, $ctx.PSEdition)
     if (-not $ctx.IsAdmin) { Write-CDTLog -Level ERROR -Message 'Administratorrechte bzw. SYSTEM-Kontext erforderlich.'; $ok = $false }
-    if (-not $ctx.IsSystem) { Write-CDTLog -Level WARN -Message 'Nicht im SYSTEM-Kontext: Einstellungen werden ueber den aktuellen Admin-Benutzer kopiert (Nerdio/HYDRA laufen als SYSTEM).' }
+    if ($ctx.IsAdmin -and -not $ctx.IsSystem) { Write-CDTLog -Level WARN -Message 'Nicht im SYSTEM-Kontext: Einstellungen werden ueber den aktuellen Admin-Benutzer kopiert (Nerdio/HYDRA laufen als SYSTEM).' }
     if (-not $ctx.Is64BitProcess) { Write-CDTLog -Level ERROR -Message '64-Bit-PowerShell erforderlich (DISM/Registry-Umleitung).'; $ok = $false }
     if ($PSVersionTable.PSVersion.Major -ne 5) { Write-CDTLog -Level WARN -Message ('Getestet fuer Windows PowerShell 5.1, gefunden: {0}.' -f $ctx.PSVersion) }
 
     $os = Get-CDTOsInfo
     Write-CDTLog -Message ('OS: {0} | Build {1} | DisplayVersion {2} | Edition {3} | Typ {4}' -f $os.ProductName, $os.BuildUbr, $os.DisplayVersion, $os.EditionId, $os.InstallationType)
-    $pkgBuild = Get-CDTInstalledLanguagePackBuild -PreferLanguage 'en-US'
+    # Get-WindowsPackage braucht Adminrechte; ohne sie wird nur der OS-Build bewertet
+    $pkgBuild = 0
+    if ($ctx.IsAdmin) { $pkgBuild = Get-CDTInstalledLanguagePackBuild -PreferLanguage 'en-US' }
     $base = Get-CDTServicingBaseBuild -CurrentBuild $os.Build -PackageBuild $pkgBuild
     $level = 'INFO'
     if ($base.Severity -eq 'WARN') { $level = 'WARN' } elseif ($base.Severity -eq 'ERROR') { $level = 'ERROR' }
@@ -4402,6 +4410,7 @@ function Invoke-CDTMain {
     $acquired = $false
     $skipCompletion = $false
     $specialMode = $false
+    $noAdmin = $false
     try {
         $script:Cfg = Build-CDTConfiguration
         $script:ModeName = $script:Cfg.Mode
@@ -4439,6 +4448,7 @@ function Invoke-CDTMain {
             return
         }
         $pre = Test-CDTPrerequisite
+        if (-not $pre.Context.IsAdmin) { $noAdmin = $true }
         if (-not $pre.Ok) { throw 'Vorpruefung fehlgeschlagen - keine Aenderungen vorgenommen.' }
         Restore-CDTCrashLeftover
 
@@ -4458,6 +4468,14 @@ function Invoke-CDTMain {
         if ($null -eq $script:Cfg -or $skipCompletion) {
             $script:FinalExitCode = 3050
             Write-Output ('CDT Sprachpaket: FAILED (ExitCode 3050) - siehe Log {0}' -f $script:LogFile)
+        }
+        elseif ($noAdmin) {
+            # Ohne Adminrechte sind Compliance-Pruefung und Zustand nicht lesbar/schreibbar
+            $script:FinalStatus = 'FAILED'
+            $script:FinalExitCode = 3050
+            Write-CDTLog -Message 'Ende: Status FAILED, ExitCode 3050 (als Administrator bzw. SYSTEM ausfuehren, z. B. ueber Nerdio/HYDRA).'
+            Close-CDTTranscript
+            Write-Output ('CDT Sprachpaket: FAILED (ExitCode 3050) - Administratorrechte bzw. SYSTEM erforderlich, keine Aenderungen. Log: {0}' -f $script:LogFile)
         }
         elseif ($specialMode) {
             if (@($script:StatusFlags) -contains 'FAILED') { $script:FinalExitCode = 3050 }

@@ -554,3 +554,45 @@ Describe 'Mode ExitCodeTest (integriert)' {
         $script:Cfg = Build-TestConfig
     }
 }
+
+Describe 'Vorpruefung und OS-Anzeige (8.0.1, Mocks)' {
+    It 'Windows 11 statt Registry-ProductName "Windows 10" ab Build 22000' {
+        Mock -CommandName Get-CDTRegistryValue -MockWith {
+            switch ($Name) {
+                'CurrentBuildNumber' { '26300' }
+                'UBR' { 9457 }
+                'ProductName' { 'Windows 10 Enterprise multi-session' }
+                default { '' }
+            }
+        }
+        (Get-CDTOsInfo).ProductName | Should -Be 'Windows 11 Enterprise multi-session'
+    }
+    It 'Aelterer Build behaelt den Registry-ProductName' {
+        Mock -CommandName Get-CDTRegistryValue -MockWith {
+            switch ($Name) {
+                'CurrentBuildNumber' { '19045' }
+                'ProductName' { 'Windows 10 Enterprise' }
+                default { 0 }
+            }
+        }
+        (Get-CDTOsInfo).ProductName | Should -Be 'Windows 10 Enterprise'
+    }
+    It 'Ohne Adminrechte: Ok=False, keine Paketabfrage (Elevation) und kein SYSTEM-Hinweis' {
+        Mock -CommandName Get-CDTExecutionContext -MockWith {
+            [pscustomobject]@{ User = 'AzureAD\Test'; Sid = 'S-1-12-1'; IsAdmin = $false; IsSystem = $false; Is64BitProcess = $true; PSVersion = '5.1'; PSEdition = 'Desktop' }
+        }
+        Mock -CommandName Get-CDTOsInfo -MockWith {
+            [pscustomobject]@{ Build = 26300; Ubr = 9457; BuildUbr = '26300.9457'; DisplayVersion = '26H2'; EditionId = 'ServerRdsh'; ProductName = 'Windows 11 Enterprise multi-session'; InstallationType = 'Client' }
+        }
+        Mock -CommandName Get-CDTInstalledLanguagePackBuild -MockWith { 26100 }
+        Mock -CommandName Get-Module -MockWith { [pscustomobject]@{ Name = 'x' } }
+        Mock -CommandName Write-CDTLog -MockWith { }
+        $savedDrive = $env:SystemDrive
+        if ([string]::IsNullOrEmpty($env:SystemDrive)) { $env:SystemDrive = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetTempPath()) }
+        try { $r = Test-CDTPrerequisite } finally { $env:SystemDrive = $savedDrive }
+        $r.Ok | Should -Be $false
+        Assert-MockCalled -CommandName Get-CDTInstalledLanguagePackBuild -Times 0 -Exactly -Scope It
+        Assert-MockCalled -CommandName Write-CDTLog -Times 0 -Exactly -Scope It -ParameterFilter { $Message -like 'Nicht im SYSTEM-Kontext*' }
+        Assert-MockCalled -CommandName Write-CDTLog -Times 1 -Exactly -Scope It -ParameterFilter { $Level -eq 'ERROR' -and $Message -like 'Administratorrechte*' }
+    }
+}

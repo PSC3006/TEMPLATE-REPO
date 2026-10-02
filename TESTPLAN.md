@@ -1,4 +1,4 @@
-# Testplan – CDT Sprachpaket de-DE (Install-DE_V8.ps1 v8.0.0)
+# Testplan – CDT Sprachpaket de-DE (Install-DE_V8.ps1 v8.0.1)
 
 Testumgebung: frische Azure-Marketplace-VMs **Windows 11 Enterprise multi-session** 24H2 (26100), 25H2 (26200), 26H2 (26300),
 jeweils mit aktuellem Patchstand. Ausführung über Nerdio Scripted Action **und** HYDRA-Script. Nach jedem Test:
@@ -100,4 +100,4 @@ Legende Ergebnis: ✅ bestanden · ❌ fehlgeschlagen · ⏳ offen
 |---|---|
 | Parser (`[Parser]::ParseFile`) aller Scripts | 0 Fehler |
 | PSScriptAnalyzer 1.23 (inkl. Kompatibilität PS 5.1) | 0 Funde |
-| Pester 4.10 (nur Mocks) | 82/82 bestanden |
+| Pester 4.10 (nur Mocks) | 85/85 bestanden |
