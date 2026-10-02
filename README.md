@@ -6,13 +6,13 @@ Windows 11 Enterprise (Single-/Multi-Session) 24H2, 25H2 und 26H2 auf Deutschlan
 
 | Datei | Zweck |
 |---|---|
-| `Install-CDTGermanLanguage.ps1` | Hauptscript (Modes Auto/Install/ReapplyLcu/Validate/PreSysprep), Version 4.0.0 |
-| `New-CDTLanguageRepository.ps1` | Einmalig pro OS-Hauptbuild: minimales Repository (Stufe 2) erzeugen, versionieren, hochladen |
-| `Test-CDTExitCodeHandling.ps1` | Ändert nichts; prüft, wie Nerdio/HYDRA einen Exit-Code bewerten |
-| `tests/*.Tests.ps1` | Pester-Tests (Pester 4.10/5.x) nur mit Mocks, keine Systemaufrufe |
+| `Install-DE_V8.ps1` | **Das eine Script** (Version 8.0.0): Modes Auto/Install/ReapplyLcu/Validate/PreSysprep sowie CreateRepository (Repository Stufe 2) und ExitCodeTest |
+| `tests/Install-DE_V8.Tests.ps1` | Pester-Tests (Pester 4.10/5.x) nur mit Mocks, keine Systemaufrufe |
 | `PSScriptAnalyzerSettings.psd1` | Analyzer-Regeln inkl. Kompatibilität Windows PowerShell 5.1 |
 | `TESTPLAN.md` | Testplan für Marketplace-VMs 24H2/25H2/26H2 |
-| `CDT-STANDARD-DE-LANGUAGE.ps1` | **Legacy (v3.1)**, durch `Install-CDTGermanLanguage.ps1` abgelöst; unverändert belassen |
+| `CDT-STANDARD-DE-LANGUAGE.ps1` | **Legacy (v3.1)**, durch `Install-DE_V8.ps1` abgelöst; unverändert belassen |
+
+Für den Betrieb wird **nur `Install-DE_V8.ps1`** benötigt; alle übrigen Dateien sind Tests und Dokumentation.
 
 ---
 
@@ -20,16 +20,16 @@ Windows 11 Enterprise (Single-/Multi-Session) 24H2, 25H2 und 26H2 auf Deutschlan
 
 ```powershell
 # Mode Auto ohne Parameter: führt die nächste offene Phase aus (Stufe 1 = Windows Update)
-.\Install-CDTGermanLanguage.ps1
+.\Install-DE_V8.ps1
 
 # Mit Repository (Stufe 2) aus Azure Files
-.\Install-CDTGermanLanguage.ps1 -RepositoryPath '\\stcdtlang.file.core.windows.net\langrepo\26100' -StorageAccountKey $Key
+.\Install-DE_V8.ps1 -RepositoryPath '\\stcdtlang.file.core.windows.net\langrepo\26100' -StorageAccountKey $Key
 
 # LCU erneut anwenden (MSU-Ordner mit Ziel- und Checkpoint-MSU)
-.\Install-CDTGermanLanguage.ps1 -Mode ReapplyLcu -LcuPath 'C:\Install\LCU'
+.\Install-DE_V8.ps1 -Mode ReapplyLcu -LcuPath 'C:\Install\LCU'
 
 # Letzter Schritt vor Sysprep/Capture
-.\Install-CDTGermanLanguage.ps1 -Mode PreSysprep -CleanupAppxForSysprep
+.\Install-DE_V8.ps1 -Mode PreSysprep -CleanupAppxForSysprep
 ```
 
 **Pipeline (MS-09: Apps nach den Sprachen):**
@@ -45,6 +45,8 @@ Mit `-Mode Auto` genügt nach jedem Neustart derselbe Aufruf, bis `SUCCESS` (Exi
 | `ReapplyLcu` | LCU nach der Sprachinstallation erneut installieren (MS-08) |
 | `Validate` | Soll/Ist-Prüfung ohne Änderungen (Ausnahme: Rollback abgebrochener temporärer Änderungen) |
 | `PreSysprep` | Validate + harte Sysprep-Readiness; offener MUSS-Punkt → `PRESYSPREP_BLOCKED` |
+| `CreateRepository` | Einmalig pro OS-Hauptbuild: Repository Stufe 2 erzeugen (Abschnitt 7); ändert keine Ländereinstellungen |
+| `ExitCodeTest` | Ändert nichts; gibt nur `-TestExitCode` zurück (Abschnitt 3) |
 
 Zustand: `HKLM:\SOFTWARE\CDT\LanguageDeployment\de-DE`
 
@@ -78,7 +80,7 @@ Die Custom Script Extension wertet laut Microsoft **jeden Exit-Code ≠ 0 als �
 ([Debug CSE/Run Command](https://learn.microsoft.com/troubleshoot/azure/virtual-machines/windows/debug-customscriptextension-runcommand-scripts)).
 Nerdio nutzt die CSE – 3010 wird dort voraussichtlich als Fehler angezeigt. Für HYDRA ist das Verhalten nicht belegt.
 
-1. `Test-CDTExitCodeHandling.ps1` als Scripted Action bzw. HYDRA-Script je einmal mit `-ExitCode 0`, `3010`, `3020` ausführen.
+1. `Install-DE_V8.ps1 -Mode ExitCodeTest -TestExitCode <Code>` als Scripted Action bzw. HYDRA-Script je einmal mit `0`, `3010`, `3020` ausführen (ändert nichts am System).
 2. Ergebnis eintragen:
 
 | Plattform | 0 | 3010 | 3020 | Empfohlener `-RebootRequiredExitCode` |
@@ -97,7 +99,7 @@ Fakten (Quellen: [Scripted Actions: Windows scripts](https://nmmhelp.getnerdio.c
 Ausführung über die Azure Custom Script Extension als LocalSystem, **90 Minuten Timeout**, ein Neustart *im* Script lässt den Vorgang scheitern,
 Parameter-Block wird unterstützt (string/int/bool/switch/string[]), `$SecureVars` mit `ParameterSetName = 'NME_PARAMETER'`.
 
-1. **Scripted Action anlegen:** *Scripted Actions → Windows scripts → Add*, Inhalt von `Install-CDTGermanLanguage.ps1` einfügen (Header `#description`, `#execution mode: Individual`, `#tags` sind enthalten).
+1. **Scripted Action anlegen:** *Scripted Actions → Windows scripts → Add*, Inhalt von `Install-DE_V8.ps1` einfügen (Header `#description`, `#execution mode: Individual`, `#tags` sind enthalten).
 2. **Secure Variables** (*Settings → Nerdio → Secure variables*), der Scripted Action zuweisen:
    `CDTLangStorageAccountKey`, `CDTLangRepositoryZipUrl`, `CDTLangRepositoryPath`, `CDTLangLcuUrl` (mehrere URLs mit `;`), `CDTLangLcuPath`.
    Das Script übernimmt sie nur, wenn der gleichnamige Parameter leer ist. Werte werden nie geloggt.
@@ -127,7 +129,7 @@ Scripts laufen im SYSTEM-Kontext, Script Collections verketten Scripts und Aktio
 Imaging erfolgt auf einer temporären Kopie, vor Sysprep wird `C:\Windows\Temp\PreImageCustomizing.ps1` ausgeführt.
 **Nicht belegt:** Auswertung von Exit-Codes, Timeout, Syntax für Secrets → per Exit-Code-Test (Abschnitt 3) prüfen.
 
-1. Script unter *Scripts* anlegen (Inhalt `Install-CDTGermanLanguage.ps1`). Parameter über die HYDRA-Script-Parameter oder – falls nicht verfügbar – als Defaults im `param()`-Block anpassen. Secrets nur über HYDRA-Variablen/-Parameter, nie fest im Code.
+1. Script unter *Scripts* anlegen (Inhalt `Install-DE_V8.ps1`). Parameter über die HYDRA-Script-Parameter oder – falls nicht verfügbar – als Defaults im `param()`-Block anpassen. Secrets nur über HYDRA-Variablen/-Parameter, nie fest im Code.
 2. **Script Collection** „CDT Sprache de-DE“:
    `Script (Mode Auto)` → `Restart` → `Script (Mode Auto)` → `Restart` → `Script (Mode Auto, prüft Validate)` → *Apps* → `Script (Mode PreSysprep)`
    On Error: Collection stoppen (VM nicht löschen, Diagnose sichern).
@@ -151,19 +153,21 @@ Stufe 2/3: zuerst Sprachpaket (`Add-WindowsPackage -Online`), danach Language-Fo
 ## 7. Repository erstellen, aktualisieren, versionieren (Stufe 2)
 
 ```powershell
-# Lokal, mit ZIP
-.\New-CDTLanguageRepository.ps1 -RepositoryRoot 'D:\LangRepo' -CreateZip
+# Lokal, mit ZIP (auf einer Build-VM mit gleichem Image wie der Master)
+.\Install-DE_V8.ps1 -Mode CreateRepository -RepositoryPath 'D:\LangRepo' -RepositoryCreateZip
 
 # Direkt nach Azure Files (temporär verbunden), WinPE-Sprachpakete für WinRE inklusive
-.\New-CDTLanguageRepository.ps1 -RepositoryRoot '\\stcdtlang.file.core.windows.net\langrepo' -StorageAccountKey $Key -IncludeWinPE
+.\Install-DE_V8.ps1 -Mode CreateRepository -RepositoryPath '\\stcdtlang.file.core.windows.net\langrepo' -StorageAccountKey $Key -IncludeWinRELanguage
 
-# ZIP nach Azure Blob (Container-SAS mit Schreibrecht; azcopy wenn vorhanden, sonst curl.exe)
-.\New-CDTLanguageRepository.ps1 -RepositoryRoot 'D:\LangRepo' -CreateZip -UploadBlobContainerSasUrl $ContainerSas
+# ZIP nach Azure Blob (Container-SAS mit Schreibrecht; azcopy wenn vorhanden bzw. -AzCopyPath, sonst curl.exe)
+.\Install-DE_V8.ps1 -Mode CreateRepository -RepositoryPath 'D:\LangRepo' -RepositoryUploadSasUrl $ContainerSas
 ```
+
+Mode `CreateRepository` ändert keine Sprache, Locale oder Zeitzone; er lädt das LOF-ISO (oder nutzt `-IsoPath`), exportiert und erzeugt `manifest.json`.
 
 - Struktur: `<Root>\26100\de-DE_<yyyy-MM-dd>\` (+ `manifest.json`), optional `<Root>\26100\de-DE_<yyyy-MM-dd>.zip`.
 - `-RepositoryPath` darf auf `<Root>`, `<Root>\26100` oder einen Versionsordner zeigen – ohne Versionsangabe wird die neueste Version gewählt.
-- Export: `DISM /Export-Source` (Microsoft dokumentiert `/Image`; `/Online` ist unbestätigt und wird zuerst versucht), Fallback `/Image` mit `-ImagePath`, danach Vollkopie von `LanguagesAndOptionalFeatures`. Satelliten-FoDs werden nur exportiert, wenn sie auf der Build-VM installiert sind (Build-VM = gleiches Image wie Master).
+- Export: `DISM /Export-Source` (Microsoft dokumentiert `/Image`; `/Online` ist unbestätigt und wird zuerst versucht), Fallback `/Image` mit `-RepositoryImagePath` (Steuerung über `-RepositoryExportMethod`), danach Vollkopie von `LanguagesAndOptionalFeatures`. Satelliten-FoDs werden nur exportiert, wenn sie auf der Build-VM installiert sind (Build-VM = gleiches Image wie Master).
 - **Aktualisieren:** nur bei neuem OS-Hauptbuild bzw. neuem LOF-ISO nötig; neuer Versionsordner, alter bleibt für Rollback. Language-Komponenten werden über das LCU aktualisiert (deshalb MS-08), nicht über das Repository.
 - Für `-RepositoryZipUrl` eine **Lese-SAS** auf den Blob erzeugen und als Nerdio Secure Variable `CDTLangRepositoryZipUrl` hinterlegen.
 
@@ -288,9 +292,9 @@ Bei Abweichung von der Vorgabe wurden Unterstriche in Dateinamen ergänzt (Entsc
 Ausschließlich statisch (kein Ausführen der Scripts): Parser, PSScriptAnalyzer 1.23 (inkl. `PSUseCompatibleSyntax`/`PSUseCompatibleCommands` für Windows PowerShell 5.1), Pester mit Mocks.
 
 ```powershell
-Invoke-ScriptAnalyzer -Path .\Install-CDTGermanLanguage.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
+Invoke-ScriptAnalyzer -Path .\Install-DE_V8.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
 Invoke-ScriptAnalyzer -Path .\tests -Settings .\tests\PSScriptAnalyzerSettings.Tests.psd1
 Invoke-Pester -Script .\tests     # Pester 4.10 oder 5.x
 ```
 
-Ergebnis (2026-10-02): Parser 0 Fehler (alle Scripts); PSScriptAnalyzer 0 Funde (`Install-CDTGermanLanguage.ps1`, `New-CDTLanguageRepository.ps1`, `Test-CDTExitCodeHandling.ps1`, Tests); Pester 84/84 bestanden. Alle `.ps1` sind reines ASCII (Windows PowerShell 5.1 liest Dateien ohne BOM als ANSI).
+Ergebnis (2026-10-02): Parser 0 Fehler; PSScriptAnalyzer 0 Funde (`Install-DE_V8.ps1` und Tests); Pester 82/82 bestanden. Alle `.ps1` sind reines ASCII (Windows PowerShell 5.1 liest Dateien ohne BOM als ANSI).

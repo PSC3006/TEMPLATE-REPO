@@ -1,4 +1,4 @@
-#description: CDT STANDARD - Deutsches Sprachpaket (de-DE) inkl. Language-FoDs installieren und Windows auf Deutschland einstellen (AVD-Master-Image, Windows 11 24H2/25H2/26H2). Mode Auto: nach jedem Neustart erneut ausfuehren, bis SUCCESS.
+#description: CDT STANDARD Install-DE_V8 - Deutsches Sprachpaket (de-DE) inkl. Language-FoDs verlaesslich installieren und Windows auf Deutschland einstellen (AVD-Master-Image, Windows 11 24H2/25H2/26H2). Ohne Parameter (Mode Auto) nach jedem Neustart erneut ausfuehren, bis SUCCESS. Enthaelt auch Repository-Erstellung (Mode CreateRepository) und Exit-Code-Test (Mode ExitCodeTest).
 #execution mode: Individual
 #tags: CDT, Language, de-DE, AVD, Image
 
@@ -22,6 +22,13 @@
       Validate    Soll/Ist-Pruefung ohne Aenderungen.
       PreSysprep  Validate + harte Sysprep-Readiness. Endet mit PRESYSPREP_BLOCKED (3040), wenn auch nur ein
                   MUSS-Punkt offen ist. Letzter Schritt vor "Set as Image"/Capture.
+      CreateRepository
+                  Einmalig pro OS-Hauptbuild (interaktiv als Admin, idealerweise auf einer VM mit gleichem Image):
+                  LOF-ISO laden/einbinden, DISM /Export-Source (Online -> Image -> Vollkopie), Sprachpaket dazu,
+                  manifest.json (SHA256), Ablage <RepositoryPath>\<Build>\<Sprache>_<yyyy-MM-dd>, optional ZIP
+                  und Upload nach Azure Blob. Aendert die Spracheinstellungen dieser Maschine nicht.
+      ExitCodeTest
+                  Aendert nichts und beendet sich mit -TestExitCode. Zeigt, wie Nerdio/HYDRA einen Exit-Code werten.
 
     Empfohlene Pipeline: Install -> Reboot -> ReapplyLcu -> Reboot -> Apps installieren -> PreSysprep ->
     Sysprep/Capture durch Nerdio/HYDRA. Mit -Mode Auto genuegt nach jedem Neustart derselbe Aufruf.
@@ -38,7 +45,7 @@
       3050                       FAILED
 
 .PARAMETER Mode
-    Auto (Default), Install, ReapplyLcu, Validate, PreSysprep.
+    Auto (Default), Install, ReapplyLcu, Validate, PreSysprep, CreateRepository, ExitCodeTest.
 
 .PARAMETER Language
     BCP-47-Sprache. Default de-DE.
@@ -55,6 +62,7 @@
 .PARAMETER RepositoryPath
     Stufe 2: UNC-Pfad (Azure Files) oder lokaler Pfad des Repositorys. Darf auf den Versionsordner
     (<Root>\26100\de-DE_<yyyy-MM-dd>), auf <Root>\26100 oder auf <Root> zeigen (neueste Version wird gewaehlt).
+    Mode CreateRepository: Wurzel <Root>, unter der die neue Version abgelegt wird.
 
 .PARAMETER RepositoryZipUrl
     Stufe 2: HTTPS-URL (inkl. SAS) einer ZIP-Datei des Repositorys in Azure Blob. Wird nie geloggt.
@@ -96,6 +104,7 @@
 
 .PARAMETER IncludeWinRELanguage
     MS-14: WinRE-Sprachpaket aus dem LOF-ISO/Repository in WinRE integrieren (reagentc).
+    Mode CreateRepository: WinPE-Sprachpakete (WinPE_OCs\<sprache>) ins Repository uebernehmen.
 
 .PARAMETER RebootIfRequired
     Startet am Ende neu, wenn ein Neustart ansteht (nicht zusammen mit -ForceReboot).
@@ -142,24 +151,61 @@
     Nerdio Secure Variables (wird von Nerdio uebergeben). Unterstuetzte Namen: CDTLangStorageAccountKey,
     CDTLangRepositoryZipUrl, CDTLangRepositoryPath, CDTLangLcuUrl, CDTLangLcuPath.
 
-.EXAMPLE
-    .\Install-CDTGermanLanguage.ps1
-    Mode Auto ohne Parameter: naechste offene Phase ausfuehren (Stufe 1 Windows Update).
+.PARAMETER TestExitCode
+    Mode ExitCodeTest: zurueckzugebender Exit-Code. Default 3010.
+
+.PARAMETER RepositoryOsBaseBuild
+    Mode CreateRepository: OS-Hauptbuild. 0 (Default) = aus ISO-Name bzw. Sprachpaket-Version.
+
+.PARAMETER RepositoryExportMethod
+    Mode CreateRepository: Auto (Default: Online -> Image -> FullCopy), Online, Image, FullCopy.
+
+.PARAMETER RepositoryImagePath
+    Mode CreateRepository: eingebundenes Offline-Image (Mount-Ordner von install.wim) fuer DISM /Image.
+
+.PARAMETER RepositorySatelliteCapability
+    Mode CreateRepository: FoDs mit Satellitenpaketen, die mitexportiert werden (Online nur, wenn installiert).
+
+.PARAMETER RepositoryCreateZip
+    Mode CreateRepository: zusaetzlich <Sprache>_<Datum>.zip neben dem Versionsordner ablegen.
+
+.PARAMETER RepositoryUploadSasUrl
+    Mode CreateRepository: Container-SAS-URL (Schreibrecht) fuer den ZIP-Upload nach Azure Blob (erzeugt das ZIP
+    automatisch). Wird nie geloggt.
+
+.PARAMETER AzCopyPath
+    Mode CreateRepository: Pfad zu azcopy.exe. Ohne Angabe azcopy aus PATH, sonst curl.exe (max. 5000 MiB).
 
 .EXAMPLE
-    .\Install-CDTGermanLanguage.ps1 -Mode Install -RepositoryPath '\\stcdtlang.file.core.windows.net\langrepo\26100' -StorageAccountKey $Key
+    .\Install-DE_V8.ps1
+    Mode Auto ohne Parameter: naechste offene Phase ausfuehren (Stufe 1 Windows Update, Fallback LOF-ISO).
 
 .EXAMPLE
-    .\Install-CDTGermanLanguage.ps1 -Mode ReapplyLcu -LcuPath 'C:\Install\LCU'
+    .\Install-DE_V8.ps1 -Mode Install -RepositoryPath '\\stcdtlang.file.core.windows.net\langrepo\26100' -StorageAccountKey $Key
 
 .EXAMPLE
-    .\Install-CDTGermanLanguage.ps1 -Mode PreSysprep -CleanupAppxForSysprep
+    .\Install-DE_V8.ps1 -Mode ReapplyLcu -LcuPath 'C:\Install\LCU'
+
+.EXAMPLE
+    .\Install-DE_V8.ps1 -Mode PreSysprep -CleanupAppxForSysprep
+
+.EXAMPLE
+    .\Install-DE_V8.ps1 -Mode CreateRepository -RepositoryPath '\\stcdtlang.file.core.windows.net\langrepo' -StorageAccountKey $Key -RepositoryCreateZip
+    Einmalig pro OS-Hauptbuild: Repository fuer Stufe 2 erstellen.
+
+.EXAMPLE
+    .\Install-DE_V8.ps1 -Mode ExitCodeTest -TestExitCode 3010
+    Aendert nichts; zeigt, wie Nerdio/HYDRA den Exit-Code 3010 werten.
 
 .NOTES
-    Version : 4.0.0 (2026-10-02)
+    Datei   : Install-DE_V8.ps1
+    Version : 8.0.0 (2026-10-02)
     Autor   : CDT
 
     CHANGELOG
+      8.0.0  2026-10-02  Ein Script fuer alles: Repository-Erstellung (Mode CreateRepository) und Exit-Code-Test
+                         (Mode ExitCodeTest) integriert, ersetzt New-CDTLanguageRepository.ps1 und
+                         Test-CDTExitCodeHandling.ps1. Dateiname Install-DE_V8.ps1, Version an Dateiname angeglichen.
       4.0.0  2026-10-02  Neuentwicklung, loest CDT-STANDARD-DE-LANGUAGE.ps1 (v3.1) ab:
                          Modes Auto/Install/ReapplyLcu/Validate/PreSysprep, Zustandsmodell ueber Reboots,
                          Quellen-Kette Windows Update -> Repository -> LOF-ISO, Compliance MS-01..MS-16 und
@@ -174,7 +220,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Auto', 'Install', 'ReapplyLcu', 'Validate', 'PreSysprep')]
+    [ValidateSet('Auto', 'Install', 'ReapplyLcu', 'Validate', 'PreSysprep', 'CreateRepository', 'ExitCodeTest')]
     [string]$Mode = 'Auto',
 
     [ValidatePattern('^[a-z]{2,3}-[A-Z]{2}$')]
@@ -251,6 +297,32 @@ param(
 
     [switch]$CollectWindowsUpdateLog,
 
+    [ValidateRange(0, 2147483647)]
+    [int]$TestExitCode = 3010,
+
+    [ValidateRange(0, 99999)]
+    [int]$RepositoryOsBaseBuild = 0,
+
+    [ValidateSet('Auto', 'Online', 'Image', 'FullCopy')]
+    [string]$RepositoryExportMethod = 'Auto',
+
+    [string]$RepositoryImagePath = '',
+
+    [string[]]$RepositorySatelliteCapability = @(
+        'App.StepsRecorder~~~~0.0.1.0'
+        'Microsoft.Windows.Notepad.System~~~~0.0.1.0'
+        'Microsoft.Windows.PowerShell.ISE~~~~0.0.1.0'
+        'Print.Management.Console~~~~0.0.1.0'
+        'Print.Fax.Scan~~~~0.0.1.0'
+        'WMIC~~~~'
+    ),
+
+    [switch]$RepositoryCreateZip,
+
+    [string]$RepositoryUploadSasUrl = '',
+
+    [string]$AzCopyPath = '',
+
     # Nerdio Secure Variables: Nerdio verlangt fuer eingebaute Variablen das Parameterset NME_PARAMETER.
     [Parameter(ParameterSetName = 'NME_PARAMETER')]
     [object]$SecureVars = $null
@@ -294,11 +366,19 @@ $script:ParamSnapshot = @{
     AllowTemporaryWuPolicyBypass = [bool]$AllowTemporaryWuPolicyBypass
     AutoTimeZoneUpdate           = $AutoTimeZoneUpdate
     CollectWindowsUpdateLog      = [bool]$CollectWindowsUpdateLog
+    TestExitCode                 = $TestExitCode
+    RepositoryOsBaseBuild        = $RepositoryOsBaseBuild
+    RepositoryExportMethod       = $RepositoryExportMethod
+    RepositoryImagePath          = $RepositoryImagePath
+    RepositorySatelliteCapability = @($RepositorySatelliteCapability)
+    RepositoryCreateZip          = [bool]$RepositoryCreateZip
+    RepositoryUploadSasUrl       = $RepositoryUploadSasUrl
+    AzCopyPath                   = $AzCopyPath
     SecureVars                   = $SecureVars
 }
 
 #region Konstanten und Laufzeitstatus
-$script:ScriptVersion = '4.0.0'
+$script:ScriptVersion = '8.0.0'
 $script:ScriptBaseName = 'CDT-STANDARD-Install_DE-Language'
 $script:RunStart = Get-Date
 $script:RunTimestamp = $script:RunStart.ToString('yyyy-MM-dd_HHmmss')
@@ -946,6 +1026,14 @@ function Build-CDTConfiguration {
         AllowTemporaryWuPolicyBypass = [bool]$p.AllowTemporaryWuPolicyBypass
         AutoTimeZoneUpdate           = [string]$p.AutoTimeZoneUpdate
         CollectWindowsUpdateLog      = [bool]$p.CollectWindowsUpdateLog
+        TestExitCode                 = [int]$p.TestExitCode
+        RepositoryOsBaseBuild        = [int]$p.RepositoryOsBaseBuild
+        RepositoryExportMethod       = [string]$p.RepositoryExportMethod
+        RepositoryImagePath          = [string]$p.RepositoryImagePath
+        RepositorySatelliteCapability = @(@($p.RepositorySatelliteCapability) | Where-Object { $_ })
+        RepositoryCreateZip          = [bool]$p.RepositoryCreateZip
+        RepositoryUploadSasUrl       = [string]$p.RepositoryUploadSasUrl
+        AzCopyPath                   = [string]$p.AzCopyPath
         SecureVarsUsed               = $false
     }
     $secureVars = $p.SecureVars
@@ -974,6 +1062,7 @@ function Build-CDTConfiguration {
     }
     Add-CDTSecret -Value $cfg.StorageAccountKey
     Add-CDTSecret -Value $cfg.RepositoryZipUrl
+    Add-CDTSecret -Value $cfg.RepositoryUploadSasUrl
     foreach ($u in @($cfg.LcuUrl)) { Add-CDTSecret -Value $u }
     return $cfg
 }
@@ -1018,7 +1107,18 @@ function Test-CDTParameterConsistency {
     if (($excl -contains 'TextToSpeech') -and -not ($excl -contains 'Speech')) {
         $errors.Add('Speech benoetigt TextToSpeech (Microsoft: Abhaengigkeit). Speech ebenfalls abwaehlen oder TextToSpeech installieren.')
     }
-    foreach ($pair in @(@('RepositoryZipUrl', $Config.RepositoryZipUrl), @('LofIsoUrl', $Config.LofIsoUrl))) {
+    if ($Config.Mode -eq 'CreateRepository') {
+        if ([string]::IsNullOrWhiteSpace($Config.RepositoryPath)) { $errors.Add('Mode CreateRepository benoetigt -RepositoryPath (Ziel-Wurzel des Repositorys).') }
+        if ($Config.RepositoryExportMethod -eq 'Image' -and [string]::IsNullOrWhiteSpace($Config.RepositoryImagePath)) { $errors.Add('-RepositoryExportMethod Image benoetigt -RepositoryImagePath.') }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($Config.RepositoryUploadSasUrl) -or $Config.RepositoryCreateZip) {
+        $warnings.Add('-RepositoryCreateZip/-RepositoryUploadSasUrl wirken nur in Mode CreateRepository.')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Config.IsoPath) -and -not [string]::IsNullOrWhiteSpace($Config.TempPath) -and
+        ($Config.IsoPath.TrimEnd('\') + '\').StartsWith(($Config.TempPath.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        $errors.Add('-IsoPath darf nicht innerhalb von -TempPath liegen (TempPath wird geloescht).')
+    }
+    foreach ($pair in @(@('RepositoryZipUrl', $Config.RepositoryZipUrl), @('LofIsoUrl', $Config.LofIsoUrl), @('RepositoryUploadSasUrl', $Config.RepositoryUploadSasUrl))) {
         if (-not [string]::IsNullOrWhiteSpace([string]$pair[1]) -and [string]$pair[1] -notmatch '^(?i)https://') {
             $errors.Add(('-{0} muss eine HTTPS-URL sein.' -f $pair[0]))
         }
@@ -2049,6 +2149,43 @@ function Open-CDTRepositorySource {
     return [pscustomobject]@{ Stage = 2; Path = $local; WinPePath = $winPe; Description = $description; Mount = $null; DownloadedIso = ''; BaseBuild = $BaseBuild }
 }
 
+function Get-CDTIsoFile {
+    <#
+    .SYNOPSIS
+        Liefert das LOF-ISO: vorhandenes -IsoPath oder Download von -LofIsoUrl (HEAD, Speicher + 20 %, Proxy-Log, curl/BITS).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+    if (-not [string]::IsNullOrWhiteSpace($script:Cfg.IsoPath)) {
+        if (-not (Test-Path -LiteralPath $script:Cfg.IsoPath)) { throw ('ISO nicht gefunden: {0}' -f $script:Cfg.IsoPath) }
+        Write-CDTLog -Message ('Vorhandenes ISO: {0}' -f $script:Cfg.IsoPath)
+        return [pscustomobject]@{ Path = $script:Cfg.IsoPath; Downloaded = $false }
+    }
+    $name = [System.Uri]::UnescapeDataString(([System.Uri]$script:Cfg.LofIsoUrl).Segments[-1])
+    $iso = Join-Path -Path $script:Cfg.TempPath -ChildPath $name
+    if (-not (Test-Path -LiteralPath $script:Cfg.TempPath)) { $null = New-Item -Path $script:Cfg.TempPath -ItemType Directory -Force }
+    $proxy = Get-CDTWinHttpProxy
+    $size = Get-CDTRemoteFileSize -Url $script:Cfg.LofIsoUrl -Proxy $proxy
+    if ($size -le 0) { Write-CDTLog -Level WARN -Message 'ISO-Groesse unbekannt (HEAD ohne Content-Length) - Speicherpruefung uebersprungen.' }
+    else {
+        $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($script:Cfg.TempPath))
+        $needed = [long]($size * 1.2)
+        Write-CDTLog -Message ('ISO {0:N1} GB, frei {1:N1} GB, benoetigt inkl. 20 % Puffer {2:N1} GB.' -f ($size / 1GB), ($drive.AvailableFreeSpace / 1GB), ($needed / 1GB))
+        if ($drive.AvailableFreeSpace -lt $needed) { throw 'Nicht genug freier Speicher fuer das ISO.' }
+    }
+    # Laufzeitbudget gilt nur fuer Image-Laeufe (Custom Script Extension: 90 Minuten), nicht fuer CreateRepository
+    $timeout = 240
+    if ($script:Cfg.Mode -ne 'CreateRepository') {
+        $remaining = Get-CDTRemainingBudget
+        if ($remaining -lt 25) { $script:BudgetExhausted = $true; throw ('Laufzeitbudget reicht nicht fuer den ISO-Download ({0} min).' -f $remaining) }
+        $timeout = [int]($remaining - 15)
+    }
+    $null = Invoke-CDTDownload -Url $script:Cfg.LofIsoUrl -Destination $iso -TimeoutMinutes $timeout -Proxy $proxy
+    if ($size -gt 0 -and (Get-Item -LiteralPath $iso).Length -ne $size) { throw 'ISO-Groesse stimmt nicht mit Content-Length ueberein.' }
+    return [pscustomobject]@{ Path = $iso; Downloaded = $true }
+}
+
 function Open-CDTIsoSource {
     <#
     .SYNOPSIS
@@ -2071,23 +2208,9 @@ function Open-CDTIsoSource {
     elseif ($isoBuild -ne $BaseBuild) {
         throw ('Stufe 3: ISO-Build {0} passt nicht zur OS-Basis {1} (MS-06).' -f $isoBuild, $BaseBuild)
     }
-    if ([string]::IsNullOrWhiteSpace($iso)) {
-        $iso = Join-Path -Path $script:Cfg.TempPath -ChildPath $name
-        $proxy = Get-CDTWinHttpProxy
-        $size = Get-CDTRemoteFileSize -Url $script:Cfg.LofIsoUrl -Proxy $proxy
-        if ($size -le 0) { Write-CDTLog -Level WARN -Message 'ISO-Groesse unbekannt (HEAD ohne Content-Length) - Speicherpruefung uebersprungen.' }
-        else {
-            $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($script:Cfg.TempPath))
-            $needed = [long]($size * 1.2)
-            Write-CDTLog -Message ('ISO {0:N1} GB, frei {1:N1} GB, benoetigt inkl. 20 % Puffer {2:N1} GB.' -f ($size / 1GB), ($drive.AvailableFreeSpace / 1GB), ($needed / 1GB))
-            if ($drive.AvailableFreeSpace -lt $needed) { throw 'Stufe 3: nicht genug freier Speicher fuer das ISO.' }
-        }
-        $remaining = Get-CDTRemainingBudget
-        if ($remaining -lt 25) { $script:BudgetExhausted = $true; throw ('Stufe 3: Laufzeitbudget reicht nicht ({0} min).' -f $remaining) }
-        $null = Invoke-CDTDownload -Url $script:Cfg.LofIsoUrl -Destination $iso -TimeoutMinutes ([int]($remaining - 15)) -Proxy $proxy
-        $downloaded = $iso
-        if ($size -gt 0 -and (Get-Item -LiteralPath $iso).Length -ne $size) { throw 'Stufe 3: ISO-Groesse stimmt nicht mit Content-Length ueberein.' }
-    }
+    $isoFile = Get-CDTIsoFile
+    $iso = $isoFile.Path
+    if ($isoFile.Downloaded) { $downloaded = $iso }
     $ctx = [pscustomobject]@{ Stage = 3; Path = ''; WinPePath = ''; Description = ''; Mount = $null; DownloadedIso = $downloaded; BaseBuild = $BaseBuild }
     try {
         $ctx.Mount = Mount-CDTIso -ImagePath $iso
@@ -3663,6 +3786,299 @@ function Invoke-CDTDelayedReboot {
 }
 #endregion
 
+#region Repository erstellen (Mode CreateRepository) und Exit-Code-Test (Mode ExitCodeTest)
+function Get-CDTRepositoryVersionFolderName {
+    <#
+    .SYNOPSIS
+        Name des Versionsordners <Sprache>_<yyyy-MM-dd>; existiert er bereits, wird _HHmm angehaengt.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildFolder,
+        [Parameter(Mandatory = $true)][string]$TargetLanguage,
+        [Parameter(Mandatory = $true)][datetime]$Date
+    )
+    $name = '{0}_{1}' -f $TargetLanguage, $Date.ToString('yyyy-MM-dd')
+    if (Test-Path -LiteralPath (Join-Path -Path $BuildFolder -ChildPath $name)) { $name = '{0}_{1}' -f $name, $Date.ToString('HHmm') }
+    return $name
+}
+
+function Test-CDTRepositoryExport {
+    <#
+    .SYNOPSIS
+        Prueft nach dem Export, ob alle Language-FoD-Cabs (ohne Fonts) im Staging liegen.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][object[]]$Capability
+    )
+    $lang = $script:Cfg.Language.ToLowerInvariant()
+    foreach ($cap in $Capability) {
+        if ($cap.Feature -eq 'Fonts') { continue }
+        $hit = @(Get-ChildItem -LiteralPath $Stage -Recurse -File -Filter ('*LanguageFeatures-{0}-{1}-Package*.cab' -f $cap.Feature, $lang) -ErrorAction SilentlyContinue)
+        if ($hit.Count -eq 0) { Write-CDTLog -Level WARN -Message ('Export unvollstaendig: {0} fehlt.' -f $cap.Name); return $false }
+    }
+    return $true
+}
+
+function Invoke-CDTRepositoryExport {
+    <#
+    .SYNOPSIS
+        DISM /Export-Source (Online, dann Image), Fallback Vollkopie von LanguagesAndOptionalFeatures. Liefert das Verfahren.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Stage
+    )
+    $caps = @(Get-CDTRequiredCapability -Language $script:Cfg.Language -ExcludeFeatures $script:Cfg.ExcludeFeatures)
+    $langCaps = @($caps | ForEach-Object { $_.Name })
+    $methods = @($script:Cfg.RepositoryExportMethod)
+    if ($script:Cfg.RepositoryExportMethod -eq 'Auto') { $methods = @('Online', 'Image', 'FullCopy') }
+    $installedSat = @()
+    try {
+        $installedSat = @(Get-WindowsCapability -Online -LimitAccess | Where-Object { [string]$_.State -eq 'Installed' -and @($script:Cfg.RepositorySatelliteCapability) -contains $_.Name } | ForEach-Object { $_.Name })
+    }
+    catch { Write-CDTLog -Level WARN -Message ('Installierte Capabilities nicht ermittelbar: {0}' -f $_.Exception.Message) }
+    Write-CDTLog -Message ('Satelliten-FoDs (auf dieser Maschine installiert): {0}' -f $(if ($installedSat.Count -gt 0) { $installedSat -join ', ' } else { 'keine' }))
+    $dism = Join-Path -Path $env:SystemRoot -ChildPath 'System32\dism.exe'
+    foreach ($method in $methods) {
+        if (Test-Path -LiteralPath $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force }
+        $null = New-Item -Path $Stage -ItemType Directory -Force
+        if ($method -eq 'FullCopy') {
+            Copy-CDTDirectory -Source $Source -Destination $Stage
+            Write-CDTLog -Message 'Vollkopie von LanguagesAndOptionalFeatures erstellt (Microsoft: zulaessig, groesser).'
+            return 'FullCopy'
+        }
+        if ($method -eq 'Image' -and [string]::IsNullOrWhiteSpace($script:Cfg.RepositoryImagePath)) {
+            Write-CDTLog -Message 'Export /Image uebersprungen (-RepositoryImagePath nicht angegeben).'
+            continue
+        }
+        $target = '/Online'
+        $exportCaps = @($langCaps) + @($installedSat)
+        if ($method -eq 'Image') {
+            $target = '/Image:{0}' -f $script:Cfg.RepositoryImagePath
+            $exportCaps = @($langCaps) + @($script:Cfg.RepositorySatelliteCapability)
+        }
+        $baseArgs = @($target, '/Export-Source', ('/Source:{0}' -f $Source.TrimEnd('\')), ('/Target:{0}' -f $Stage))
+        $r = Invoke-CDTNativeCommand -FilePath $dism -ArgumentList ($baseArgs + @($exportCaps | ForEach-Object { '/CapabilityName:{0}' -f $_ })) -TimeoutSeconds 7200
+        if ($r.ExitCode -ne 0 -and $exportCaps.Count -gt $langCaps.Count) {
+            Write-CDTLog -Level WARN -Message ('export-source {0} mit Satelliten fehlgeschlagen ({1}) - erneut nur mit Language-FoDs.' -f $method, $r.ExitCode)
+            Remove-Item -LiteralPath $Stage -Recurse -Force
+            $null = New-Item -Path $Stage -ItemType Directory -Force
+            $r = Invoke-CDTNativeCommand -FilePath $dism -ArgumentList ($baseArgs + @($langCaps | ForEach-Object { '/CapabilityName:{0}' -f $_ })) -TimeoutSeconds 7200
+        }
+        if ($r.ExitCode -eq 0 -and (Test-CDTRepositoryExport -Stage $Stage -Capability $caps)) {
+            Write-CDTLog -Message ('export-source erfolgreich ({0}).' -f $method)
+            return ('ExportSource{0}' -f $method)
+        }
+        Write-CDTLog -Level WARN -Message ('export-source {0} fehlgeschlagen (ExitCode {1}): {2}' -f $method, $r.ExitCode, (($r.StdOut + ' ' + $r.StdErr) -replace '\s+', ' ').Trim())
+    }
+    throw 'Kein Export-Verfahren erfolgreich.'
+}
+
+function Export-CDTRepositoryManifest {
+    <#
+    .SYNOPSIS
+        Schreibt manifest.json mit Metadaten und SHA256 aller Dateien des Repositorys (Gegenstueck zu Test-CDTRepositoryManifest).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Metadata
+    )
+    $root = (Get-Item -LiteralPath $Path).FullName.TrimEnd('\', '/')
+    $files = foreach ($f in @(Get-ChildItem -LiteralPath $root -File -Recurse | Where-Object { $_.Name -ne 'manifest.json' } | Sort-Object -Property FullName)) {
+        [ordered]@{
+            path   = $f.FullName.Substring($root.Length).TrimStart('\', '/').Replace('/', '\')
+            size   = $f.Length
+            sha256 = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash
+        }
+    }
+    $manifest = [ordered]@{}
+    foreach ($k in $Metadata.Keys) { $manifest[$k] = $Metadata[$k] }
+    $manifest['files'] = @($files)
+    $target = Join-Path -Path $root -ChildPath 'manifest.json'
+    [System.IO.File]::WriteAllText($target, (ConvertTo-Json -InputObject $manifest -Depth 6), $script:Utf8NoBom)
+    return $target
+}
+
+function Send-CDTZipToBlob {
+    <#
+    .SYNOPSIS
+        Laedt das Repository-ZIP in einen Blob-Container (azcopy, sonst curl.exe). SAS wird nie geloggt.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)][string]$BlobName
+    )
+    $sas = $script:Cfg.RepositoryUploadSasUrl
+    $q = $sas.IndexOf('?')
+    if ($q -lt 0) { throw 'Container-SAS-URL ohne Query (SAS) angegeben.' }
+    $blobUrl = '{0}/{1}{2}' -f $sas.Substring(0, $q).TrimEnd('/'), $BlobName, $sas.Substring($q)
+    Add-CDTSecret -Value $blobUrl
+    $azcopy = $script:Cfg.AzCopyPath
+    if (-not $azcopy) {
+        $cmd = Get-Command -Name 'azcopy.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $cmd) { $azcopy = $cmd.Source }
+    }
+    if ($azcopy -and (Test-Path -LiteralPath $azcopy)) {
+        $r = Invoke-CDTNativeCommand -FilePath $azcopy -ArgumentList @('copy', $ZipPath, $blobUrl, '--overwrite=true') -NoLog -TimeoutSeconds 7200
+        if ($r.ExitCode -ne 0) { throw ('azcopy fehlgeschlagen ({0}): {1}' -f $r.ExitCode, (Get-CDTMaskedText -Text $r.StdOut)) }
+    }
+    else {
+        if ((Get-Item -LiteralPath $ZipPath).Length -gt 5000MB) { throw 'ZIP groesser als 5000 MiB: azcopy erforderlich (-AzCopyPath).' }
+        $curl = Join-Path -Path $env:SystemRoot -ChildPath 'System32\curl.exe'
+        $r = Invoke-CDTNativeCommand -FilePath $curl -ArgumentList @('--fail', '--silent', '--show-error', '--retry', '3', '-X', 'PUT', '-H', 'x-ms-blob-type: BlockBlob', '-H', 'x-ms-version: 2021-08-06', '-T', $ZipPath, $blobUrl) -NoLog -TimeoutSeconds 7200
+        if ($r.ExitCode -ne 0) { throw ('Upload per curl fehlgeschlagen ({0}): {1}' -f $r.ExitCode, (Get-CDTMaskedText -Text $r.StdErr)) }
+    }
+    $plain = $blobUrl.Substring(0, $blobUrl.IndexOf('?'))
+    Write-CDTLog -Message ('ZIP hochgeladen: {0}' -f $plain)
+    return $plain
+}
+
+function Invoke-CDTModeCreateRepository {
+    <#
+    .SYNOPSIS
+        Mode CreateRepository: minimales, versioniertes Repository nach Microsoft-Vorgehen erzeugen und ablegen.
+        Setzt $script:FinalExitCode (0 = OK, 3050 = FAILED).
+    #>
+    [CmdletBinding()]
+    param()
+    Enter-CDTPhase 'CreateRepository'
+    $isoFile = $null
+    $mount = $null
+    $conn = $null
+    $exitCode = 3050
+    $stage = Join-Path -Path $script:Cfg.TempPath -ChildPath 'stage'
+    $lang = $script:Cfg.Language
+    try {
+        $ctx = Get-CDTExecutionContext
+        if (-not $ctx.IsAdmin) { throw 'Administratorrechte erforderlich.' }
+        $isoFile = Get-CDTIsoFile
+        $base = $script:Cfg.RepositoryOsBaseBuild
+        if ($base -le 0) { $base = Get-CDTIsoBuildFromName -Name $isoFile.Path }
+        $mount = Mount-CDTIso -ImagePath $isoFile.Path
+        $lof = Join-Path -Path $mount.Root -ChildPath 'LanguagesAndOptionalFeatures'
+        if (-not (Test-Path -LiteralPath $lof)) { throw 'LanguagesAndOptionalFeatures im ISO nicht gefunden.' }
+        $lpName = 'Microsoft-Windows-Client-Language-Pack_x64_{0}.cab' -f $lang.ToLowerInvariant()
+        $lpSource = Join-Path -Path $lof -ChildPath $lpName
+        if (-not (Test-Path -LiteralPath $lpSource)) { throw ('Sprachpaket nicht im ISO: {0}' -f $lpName) }
+        $lpBuild = Get-CDTCabPackageBuild -CabPath $lpSource
+        if ($base -le 0) { $base = $lpBuild }
+        if ($lpBuild -gt 0 -and $lpBuild -ne $base) { throw ('Sprachpaket-Build {0} passt nicht zum Hauptbuild {1}.' -f $lpBuild, $base) }
+        if ($base -le 0) { throw 'OS-Hauptbuild nicht ermittelbar (-RepositoryOsBaseBuild angeben).' }
+        Write-CDTLog -Message ('OS-Hauptbuild des Repositorys: {0} (Sprachpaket-Build {1})' -f $base, $lpBuild)
+
+        $exportMethod = Invoke-CDTStep -StepName 'DISM Export-Source' -Action { Invoke-CDTRepositoryExport -Source $lof -Stage $stage }
+        if (-not (Test-Path -LiteralPath (Join-Path -Path $stage -ChildPath $lpName))) {
+            Copy-Item -LiteralPath $lpSource -Destination $stage -Force
+            Write-CDTLog -Message ('Sprachpaket kopiert: {0}' -f $lpName)
+        }
+        $winPeIncluded = $false
+        if ($script:Cfg.IncludeWinRELanguage) {
+            $winPeSrc = Join-Path -Path $mount.Root -ChildPath ('Windows Preinstallation Environment\x64\WinPE_OCs\{0}' -f $lang.ToLowerInvariant())
+            if (Test-Path -LiteralPath $winPeSrc) {
+                Copy-CDTDirectory -Source $winPeSrc -Destination (Join-Path -Path $stage -ChildPath ('WinPE_OCs\{0}' -f $lang.ToLowerInvariant()))
+                $winPeIncluded = $true
+                Write-CDTLog -Message 'WinPE-Sprachpakete (WinRE) uebernommen.'
+            }
+            else { Write-CDTLog -Level WARN -Message ('WinPE-Sprachpakete nicht im ISO: {0}' -f $winPeSrc) }
+        }
+        $allCabs = @(Get-ChildItem -LiteralPath $stage -Recurse -File -Filter '*.cab' | ForEach-Object { $_.FullName })
+        $badSig = @(Test-CDTCabSignature -FilePath $allCabs)
+        if ($badSig.Count -gt 0) {
+            foreach ($b in $badSig) { Write-CDTLog -Level ERROR -Message ('Signatur: {0} Status={1} Signer={2}' -f $b.File, $b.Status, $b.Signer) }
+            throw 'Authenticode-Pruefung fehlgeschlagen.'
+        }
+        $isoHash = (Get-FileHash -LiteralPath $isoFile.Path -Algorithm SHA256).Hash
+        $meta = [ordered]@{
+            schemaVersion = 1
+            osBaseBuild   = [string]$base
+            language      = $lang
+            sourceIso     = [ordered]@{ name = (Split-Path -Path $isoFile.Path -Leaf); sha256 = $isoHash }
+            createdUtc    = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            createdBy     = ('Install-DE_V8.ps1 {0}' -f $script:ScriptVersion)
+            createdOn     = $env:COMPUTERNAME
+            exportMethod  = $exportMethod
+            capabilities  = @(Get-CDTRequiredCapability -Language $lang -ExcludeFeatures $script:Cfg.ExcludeFeatures | ForEach-Object { $_.Name })
+            includesWinPE = $winPeIncluded
+        }
+        $null = Export-CDTRepositoryManifest -Path $stage -Metadata $meta
+        $stageFiles = @(Get-ChildItem -LiteralPath $stage -Recurse -File)
+        $sizeMb = ($stageFiles | Measure-Object -Property Length -Sum).Sum / 1MB
+        Write-CDTLog -Message ('manifest.json erstellt: {0} Dateien, {1:N1} MB' -f $stageFiles.Count, $sizeMb)
+
+        $repoRoot = $script:Cfg.RepositoryPath.TrimEnd('\')
+        $share = Get-CDTUncShareRoot -UncPath $repoRoot
+        if ($null -ne $share) { $conn = Connect-CDTShare -UncPath $share.Root -AccountKey $script:Cfg.StorageAccountKey -StateName 'RepositoryHost' }
+        $buildFolder = Join-Path -Path $repoRoot -ChildPath ([string]$base)
+        if (-not (Test-Path -LiteralPath $buildFolder)) { $null = New-Item -Path $buildFolder -ItemType Directory -Force }
+        $versionName = Get-CDTRepositoryVersionFolderName -BuildFolder $buildFolder -TargetLanguage $lang -Date (Get-Date)
+        $versionFolder = Join-Path -Path $buildFolder -ChildPath $versionName
+        Copy-CDTDirectory -Source $stage -Destination $versionFolder
+        Write-CDTLog -Message ('Repository abgelegt: {0}' -f $versionFolder)
+
+        $blobPlain = ''
+        if ($script:Cfg.RepositoryCreateZip -or $script:Cfg.RepositoryUploadSasUrl) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = Join-Path -Path $script:Cfg.TempPath -ChildPath ('{0}.zip' -f $versionName)
+            if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+            Copy-Item -LiteralPath $zip -Destination $buildFolder -Force
+            Write-CDTLog -Message ('ZIP erstellt: {0}' -f (Join-Path -Path $buildFolder -ChildPath (Split-Path -Path $zip -Leaf)))
+            if ($script:Cfg.RepositoryUploadSasUrl) {
+                $blobPlain = Send-CDTZipToBlob -ZipPath $zip -BlobName ('{0}/{1}' -f $base, (Split-Path -Path $zip -Leaf))
+            }
+        }
+        Write-Output '==================== CDT Sprach-Repository ===================='
+        Write-Output ('Status    : SUCCESS (ExitCode 0)')
+        Write-Output ('Version   : {0}' -f $versionFolder)
+        Write-Output ('Build     : {0}, Sprache {1}, Export {2}, Dateien {3}, {4:N1} MB' -f $base, $lang, $exportMethod, $stageFiles.Count, $sizeMb)
+        Write-Output ('Stufe 2   : -RepositoryPath "{0}"' -f $buildFolder)
+        if ($blobPlain) { Write-Output ('Stufe 2   : -RepositoryZipUrl "{0}?<Lese-SAS>"' -f $blobPlain) }
+        Write-Output ('Log       : {0}' -f $script:LogFile)
+        $exitCode = 0
+    }
+    catch {
+        Write-CDTErrorRecord -ErrorRecord $_ -Context 'CreateRepository'
+        Write-Output ('CDT Sprach-Repository: FAILED (ExitCode 3050) - {0} - siehe {1}' -f (Get-CDTMaskedText -Text $_.Exception.Message), $script:ErrorLogFile)
+    }
+    finally {
+        Disconnect-CDTShare -Connection $conn
+        Dismount-CDTIso -Mount $mount
+        Clear-CDTTempPath
+    }
+    $script:FinalStatus = $(if ($exitCode -eq 0) { 'SUCCESS' } else { 'FAILED' })
+    $script:FinalExitCode = $exitCode
+}
+
+function Invoke-CDTModeExitCodeTest {
+    <#
+    .SYNOPSIS
+        Mode ExitCodeTest: keine Aenderung, nur Log/STDOUT; setzt $script:FinalExitCode = -TestExitCode.
+    #>
+    [CmdletBinding()]
+    param()
+    Enter-CDTPhase 'ExitCodeTest'
+    $code = [int]$script:Cfg.TestExitCode
+    $user = ''
+    try { $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $user = '?' }
+    $line = 'CDT Exit-Code-Test: Computer={0}, Benutzer={1}, PowerShell={2}, ExitCode={3}. Keine Systemaenderung.' -f $env:COMPUTERNAME, $user, $PSVersionTable.PSVersion, $code
+    Write-CDTLog -Message $line
+    Write-Output $line
+    $script:FinalStatus = 'ExitCodeTest'
+    $script:FinalExitCode = $code
+}
+#endregion
+
 #region Phasen
 function Invoke-CDTPhaseInstall {
     <#
@@ -3985,9 +4401,12 @@ function Invoke-CDTMain {
     $mutex = $null
     $acquired = $false
     $skipCompletion = $false
+    $specialMode = $false
     try {
         $script:Cfg = Build-CDTConfiguration
         $script:ModeName = $script:Cfg.Mode
+        # CreateRepository/ExitCodeTest aendern keine Spracheinstellungen und haben eigenen Abschluss (keine Compliance)
+        $specialMode = @('CreateRepository', 'ExitCodeTest') -contains $script:Cfg.Mode
         try { Initialize-CDTLogging } catch { Write-CDTLog -Level ERROR -Message ('Logging-Initialisierung fehlgeschlagen: {0}' -f $_.Exception.Message) }
         # Nur ein Lauf gleichzeitig (z. B. erneuter Start durch Nerdio/HYDRA waehrend ein Lauf noch aktiv ist)
         $mutex = [System.Threading.Mutex]::new($false, 'Global\CDT-LanguageDeployment')
@@ -4010,6 +4429,15 @@ function Invoke-CDTMain {
             foreach ($e in $consistency.Errors) { Write-CDTLog -Level ERROR -Message $e }
             throw 'Ungueltige Parameterkombination - keine Aenderungen vorgenommen.'
         }
+        if ($script:Cfg.Mode -eq 'ExitCodeTest') {
+            Invoke-CDTModeExitCodeTest
+            return
+        }
+        if ($script:Cfg.Mode -eq 'CreateRepository') {
+            Restore-CDTCrashLeftover
+            Invoke-CDTModeCreateRepository
+            return
+        }
         $pre = Test-CDTPrerequisite
         if (-not $pre.Ok) { throw 'Vorpruefung fehlgeschlagen - keine Aenderungen vorgenommen.' }
         Restore-CDTCrashLeftover
@@ -4030,6 +4458,11 @@ function Invoke-CDTMain {
         if ($null -eq $script:Cfg -or $skipCompletion) {
             $script:FinalExitCode = 3050
             Write-Output ('CDT Sprachpaket: FAILED (ExitCode 3050) - siehe Log {0}' -f $script:LogFile)
+        }
+        elseif ($specialMode) {
+            if (@($script:StatusFlags) -contains 'FAILED') { $script:FinalExitCode = 3050 }
+            Write-CDTLog -Message ('Ende: Mode {0}, ExitCode {1}' -f $script:Cfg.Mode, $script:FinalExitCode)
+            Close-CDTTranscript
         }
         else {
             Complete-CDTRun

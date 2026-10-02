@@ -1,4 +1,4 @@
-# Testplan – CDT Sprachpaket de-DE (Install-CDTGermanLanguage.ps1 v4.0.0)
+# Testplan – CDT Sprachpaket de-DE (Install-DE_V8.ps1 v8.0.0)
 
 Testumgebung: frische Azure-Marketplace-VMs **Windows 11 Enterprise multi-session** 24H2 (26100), 25H2 (26200), 26H2 (26300),
 jeweils mit aktuellem Patchstand. Ausführung über Nerdio Scripted Action **und** HYDRA-Script. Nach jedem Test:
@@ -10,7 +10,7 @@ Legende Ergebnis: ✅ bestanden · ❌ fehlgeschlagen · ⏳ offen
 
 | # | Test | Erwartung | 24H2 | 25H2 | 26H2 |
 |---|---|---|---|---|---|
-| 0.1 | `Test-CDTExitCodeHandling.ps1` mit 0 / 3010 / 3020 (Nerdio + HYDRA) | Bewertung je Plattform dokumentiert (README Abschnitt 3); `-RebootRequiredExitCode` festgelegt | ⏳ | ⏳ | ⏳ |
+| 0.1 | `-Mode ExitCodeTest -TestExitCode` 0 / 3010 / 3020 (Nerdio + HYDRA) | Bewertung je Plattform dokumentiert (README Abschnitt 3); `-RebootRequiredExitCode` festgelegt | ⏳ | ⏳ | ⏳ |
 | 0.2 | Script mit `-RebootIfRequired -ForceReboot` | Exit 3050, keine Änderung (Zustand/Registry unverändert) | ⏳ | ⏳ | ⏳ |
 | 0.3 | Zwei Läufe gleichzeitig starten | Zweiter Lauf: Exit 3050 „anderer Lauf aktiv“ | ⏳ | ⏳ | ⏳ |
 | 0.4 | Nerdio: Parameterblock inkl. `SecureVars` (`NME_PARAMETER`) | Felder erscheinen; `$SecureVars` wird übergeben (Log: `SecureVars=True`) | ⏳ | – | – |
@@ -100,4 +100,4 @@ Legende Ergebnis: ✅ bestanden · ❌ fehlgeschlagen · ⏳ offen
 |---|---|
 | Parser (`[Parser]::ParseFile`) aller Scripts | 0 Fehler |
 | PSScriptAnalyzer 1.23 (inkl. Kompatibilität PS 5.1) | 0 Funde |
-| Pester 4.10 (nur Mocks) | 84/84 bestanden |
+| Pester 4.10 (nur Mocks) | 82/82 bestanden |
