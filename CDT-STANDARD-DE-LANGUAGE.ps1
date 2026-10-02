@@ -1,7 +1,20 @@
 
 ####################################################################   BEGIN INDIVIDUAL SCRIPT ######################################################################
-# Version: 3.0 - 02.10.2026
-#description: v3 - de-DE Sprachpaket maschinenweit installieren und als Standard setzen (Win11 25H2+, NERDIO/SYSTEM oder Admin)
+# Version: 3.1 - 02.10.2026
+#description: v3.1 - de-DE Sprachpaket inkl. Sprachfeatures maschinenweit installieren und als Standard setzen (Win11 25H2+, NERDIO/SYSTEM oder Admin)
+#
+# Aenderungen v3.1 ("laeuft durch, installiert aber nicht verlaesslich"):
+#  - Erfolg = Language Pack UND Pflicht-Features (Basic/Rechtschreibung, Handschrift, OCR, Sprachausgabe,
+#    Spracherkennung). v3 pruefte nur das Language Pack: fehlende Features blieben unbemerkt und wurden
+#    wegen des Idempotenz-Checks auch bei weiteren Laeufen nie nachinstalliert.
+#  - Fehlende Features werden gezielt per Add-WindowsCapability nachinstalliert.
+#  - Nach Copy-UserInternationalSettingsToSystem wird das Ergebnis in HKU\.DEFAULT (Welcome Screen) und im
+#    Default-User-Profil (neue Benutzer) geprueft: Regionalformat, Datum/Uhrzeit, Region, Sprachliste.
+#    Bei Abweichung: Fallback intl.cpl, danach direkte Registry-Kopie; sonst Abbruch statt "Erfolg".
+#  - Sprachliste standardmaessig nur de-DE (kein en-US-Tastaturlayout fuer neue Benutzer), deutsche
+#    Tastatur als Standard-Eingabemethode.
+#
+# Aenderungen v3.0:
 #
 # Aenderungen v3 (Ursachen der unzuverlaessigen Laeufe in v2):
 #  - Tasks LanguageComponentsInstaller\Installation + ReconcileLanguageResources werden WAEHREND der
@@ -49,7 +62,11 @@ Write-Host "Log: $logPath"
 $Language            = 'de-DE'                    # BCP-47 Zielsprache (Anzeige, Formate, Systemgebietsschema)
 $GeoId               = 94                         # Deutschland
 $TimeZone            = 'W. Europe Standard Time'  # Berlin inkl. Sommerzeit
-$KeyboardId          = '0407:00000407'            # de-DE / Deutsch (QWERTZ), nur fuer intl.cpl-Fallback
+$KeyboardId          = '0407:00000407'            # de-DE / Deutsch (QWERTZ), Standard-Eingabemethode
+$KeepOtherLanguages  = $false                     # $true: vorhandene Sprachen (z. B. en-US) hinter de-DE behalten
+# Pflicht-Sprachfeatures (Reihenfolge = Abhaengigkeiten: Basic zuerst, Speech braucht TextToSpeech).
+# Bei Bedarf reduzieren, z. B. @('BasicTyping') fuer Hosts ohne Sprach-/Stifteingabe.
+$RequiredFeatures    = @('BasicTyping', 'Handwriting', 'OCR', 'TextToSpeech', 'Speech')
 $MaxAttempts         = 3
 $RetryDelaySec       = 60
 $InstallTimeoutMin   = 25                         # Hard-Timeout je Install-Versuch
@@ -66,6 +83,10 @@ $MuiKey       = 'HKLM:\SYSTEM\CurrentControlSet\Control\MUI\UILanguages'
 $DefaultGeoKey= 'Registry::HKEY_USERS\.DEFAULT\Control Panel\International\Geo'
 
 $LciTaskPath  = '\Microsoft\Windows\LanguageComponentsInstaller\'
+$DefUserMount = 'HKU\CDT_DefaultUser'
+
+# Get-InstalledLanguage-Feature -> FoD-Capability (Language.<Name>~~~<Sprache>~0.0.1.0)
+$FeatureCapMap = @{ BasicTyping = 'Basic'; Handwriting = 'Handwriting'; OCR = 'OCR'; TextToSpeech = 'TextToSpeech'; Speech = 'Speech' }
 
 # Merker fuer garantierte Wiederherstellung im finally-Block
 $RegRestore   = New-Object System.Collections.ArrayList   # @{Path;Name;Value}  Value $null = war nicht gesetzt
@@ -115,28 +136,78 @@ function Enable-ServiceTemporarily {
     catch { Write-Warning ("Dienst {0} konnte nicht aktiviert/gestartet werden: {1}" -f $Name, $_.Exception.Message) }
 }
 
-function Test-LanguagePackInstalled {
-    # $true, wenn das maschinenweite Language Pack (CBS-LP) installiert ist - auch wenn der Neustart
-    # noch aussteht. Nur Features (BasicTyping, ...) oder nur das benutzerbezogene LXP zaehlen NICHT
-    # (Teilinstallation, Fehlerbild 0x800F0991).
+function Get-LanguageState {
+    # Installationsstand: maschinenweites Language Pack (CBS, 'LpCab') UND Pflicht-Features.
+    # 'InstallPending' (Neustart ausstehend) zaehlt als installiert. Nur Features ohne LP oder nur das
+    # benutzerbezogene LXP zaehlen NICHT (Teilinstallation, Fehlerbild 0x800F0991).
     param([string]$Lang)
+    $lp = $false
+    $features = ''
     try {
-        $il = Get-InstalledLanguage -ErrorAction Stop | Where-Object { $_.LanguageId -eq $Lang }
-        if ($il) { Write-Host ("Get-InstalledLanguage {0}: Packs=[{1}] Features=[{2}]" -f $Lang, $il.LanguagePacks, $il.LanguageFeatures) }
-        if ($il -and ("$($il.LanguagePacks)" -match 'LpCab')) { return $true }
+        $il = Get-InstalledLanguage -ErrorAction Stop | Where-Object { $_.LanguageId -eq $Lang } | Select-Object -First 1
+        if ($il) {
+            $features = "$($il.LanguageFeatures)"
+            Write-Host ("Get-InstalledLanguage {0}: Packs=[{1}] Features=[{2}]" -f $Lang, $il.LanguagePacks, $features)
+            $lp = ("$($il.LanguagePacks)" -match 'LpCab')
+        }
     }
     catch { Write-Warning ("Get-InstalledLanguage fehlgeschlagen: {0}" -f $_.Exception.Message) }
 
-    # Fallback: CBS-Paketstatus. 'InstallPending' = installiert, wird beim Neustart abgeschlossen.
-    try {
-        $pkg = Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {
-            $_.PackageName -like '*Client-Language-Pack*' -and $_.PackageName -like "*$Lang*" -and
-            @('Installed', 'InstallPending') -contains "$($_.PackageState)"
-        } | Select-Object -First 1
-        if ($pkg) { Write-Host ("CBS-Paket: {0} ({1})" -f $pkg.PackageName, $pkg.PackageState); return $true }
+    if (-not $lp) {
+        # Fallback: CBS-Paketstatus.
+        try {
+            $pkg = Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {
+                $_.PackageName -like '*Client-Language-Pack*' -and $_.PackageName -like "*$Lang*" -and
+                @('Installed', 'InstallPending') -contains "$($_.PackageState)"
+            } | Select-Object -First 1
+            if ($pkg) { Write-Host ("CBS-Paket: {0} ({1})" -f $pkg.PackageName, $pkg.PackageState); $lp = $true }
+        }
+        catch { Write-Warning ("Get-WindowsPackage fehlgeschlagen: {0}" -f $_.Exception.Message) }
     }
-    catch { Write-Warning ("Get-WindowsPackage fehlgeschlagen: {0}" -f $_.Exception.Message) }
-    return $false
+
+    # Features: Get-InstalledLanguage, Fallback FoD-Capability-Status (erkennt auch 'InstallPending').
+    $missing = New-Object System.Collections.ArrayList
+    $caps = $null
+    foreach ($f in $RequiredFeatures) {
+        if ($features -match "\b$f\b") { continue }
+        if ($null -eq $caps) {
+            try { $caps = @(Get-WindowsCapability -Online -ErrorAction Stop | Where-Object { $_.Name -like "Language.*~~~$Lang~*" }) }
+            catch { Write-Warning ("Get-WindowsCapability fehlgeschlagen: {0}" -f $_.Exception.Message); $caps = @() }
+        }
+        $cap = $caps | Where-Object { $_.Name -like ("Language.{0}~~~{1}~*" -f $FeatureCapMap[$f], $Lang) } | Select-Object -First 1
+        if ($cap -and (@('Installed', 'InstallPending') -contains "$($cap.State)")) { continue }
+        [void]$missing.Add($f)
+    }
+
+    $state = [pscustomobject]@{
+        LanguagePack    = [bool]$lp
+        MissingFeatures = @($missing)
+        Complete        = ([bool]$lp -and $missing.Count -eq 0)
+    }
+    Write-Host ("Status {0}: LanguagePack={1}, fehlende Features=[{2}]" -f $Lang, $state.LanguagePack, ($state.MissingFeatures -join ', '))
+    return $state
+}
+
+function Add-MissingLanguageFeature {
+    # Gezielte Nachinstallation fehlender Features, falls Install-Language sie nicht vollstaendig liefert.
+    param([string]$Lang, [string[]]$Features, [datetime]$Deadline)
+    foreach ($f in $Features) {
+        $remainingMin = [int][Math]::Floor(($Deadline - (Get-Date)).TotalMinutes)
+        if ($remainingMin -lt 5) { Write-Warning 'Installationsbudget aufgebraucht - Feature-Nachinstallation abgebrochen.'; break }
+        $capName = 'Language.{0}~~~{1}~0.0.1.0' -f $FeatureCapMap[$f], $Lang
+        Write-Host ("Add-WindowsCapability {0} (Timeout {1} Min.)..." -f $capName, $remainingMin)
+        $job = Start-Job -ScriptBlock { param($n) Add-WindowsCapability -Online -Name $n -ErrorAction Stop | Out-String } -ArgumentList $capName
+        if (-not (Wait-Job -Job $job -Timeout ($remainingMin * 60))) {
+            Write-Warning ("Add-WindowsCapability {0}: Timeout." -f $capName)
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+            Wait-ServicingIdle -MaxMinutes $ServicingIdleMaxMin
+            continue
+        }
+        try { Receive-Job -Job $job -ErrorAction Stop | Write-Host }
+        catch { Write-Warning ("Add-WindowsCapability {0} fehlgeschlagen: {1} (HResult 0x{2:X8})" -f $capName, $_.Exception.Message, $_.Exception.HResult) }
+        finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Test-LanguageActive {
@@ -218,6 +289,72 @@ function Set-InternationalSettingsViaIntlCpl {
     Write-Host ("intl.cpl ExitCode: {0}" -f $p.ExitCode)
 }
 
+function Get-RegValueViaRegExe {
+    # reg.exe statt Registry-Provider: haelt keine Handles offen (wichtig fuer reg unload).
+    param([string]$Key, [string]$Name)
+    $ErrorActionPreference = 'Continue'
+    $out = & reg.exe query $Key /v $Name 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    foreach ($line in $out) {
+        if ($line -match ('^\s+{0}\s+REG_\w+\s*(.*)$' -f [regex]::Escape($Name))) { return $Matches[1].Trim() }
+    }
+    return $null
+}
+
+function Test-IntlProfile {
+    # Prueft in einem Profil-Hive: Regionalformat, Datums-/Uhrzeitformat, Region, Sprachliste/Anzeigesprache.
+    # Nicht vorhandene Format-Werte = Standard des Gebietsschemas = OK.
+    param([string]$Root, [string]$Label)
+    $ref  = New-Object System.Globalization.CultureInfo($Language, $false)
+    $intl = "$Root\Control Panel\International"
+    $v = [ordered]@{
+        LocaleName  = Get-RegValueViaRegExe $intl 'LocaleName'
+        sShortDate  = Get-RegValueViaRegExe $intl 'sShortDate'
+        sTimeFormat = Get-RegValueViaRegExe $intl 'sTimeFormat'
+        Nation      = Get-RegValueViaRegExe "$intl\Geo" 'Nation'
+        Languages   = Get-RegValueViaRegExe "$intl\User Profile" 'Languages'
+        UILanguage  = Get-RegValueViaRegExe "$Root\Control Panel\Desktop" 'PreferredUILanguages'
+        Keyboard    = Get-RegValueViaRegExe "$Root\Keyboard Layout\Preload" '1'
+    }
+    Write-Host ("[{0}] {1}" -f $Label, (($v.GetEnumerator() | ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }) -join '; '))
+    $errors = @()
+    if ($v.LocaleName -ne $Language) { $errors += 'Regionalformat' }
+    if ($v.sShortDate  -and $v.sShortDate  -ne $ref.DateTimeFormat.ShortDatePattern) { $errors += 'Datumsformat' }
+    if ($v.sTimeFormat -and $v.sTimeFormat -ne $ref.DateTimeFormat.LongTimePattern)  { $errors += 'Uhrzeitformat' }
+    if ($v.Nation      -and $v.Nation      -ne [string]$GeoId)                       { $errors += 'Region' }
+    if ($v.Languages   -and ($v.Languages  -split '\\0')[0] -ne $Language)          { $errors += 'Sprachliste' }
+    if ($v.UILanguage  -and ($v.UILanguage -split '\\0')[0] -ne $Language)          { $errors += 'Anzeigesprache' }
+    if ($errors) { Write-Warning ("[{0}] abweichend: {1}" -f $Label, ($errors -join ', ')); return $false }
+    return $true
+}
+
+function Invoke-WithDefaultUserHive {
+    # Laedt C:\Users\Default\NTUSER.DAT (Vorlage fuer neue Benutzer) temporaer nach $DefUserMount.
+    param([scriptblock]$Action)
+    $ErrorActionPreference = 'Continue'
+    $hive = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
+    $null = & reg.exe load $DefUserMount $hive 2>&1
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Default-User-Hive konnte nicht geladen werden ($hive)."; return $null }
+    try { return (& $Action $DefUserMount) }
+    finally {
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+        $null = & reg.exe unload $DefUserMount 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Default-User-Hive konnte nicht entladen werden ($DefUserMount)." }
+    }
+}
+
+function Copy-IntlRegistry {
+    # Letzter Fallback: Internationale Einstellungen des Quellprofils 1:1 in ein Zielprofil kopieren.
+    param([string]$SourceRoot, [string]$TargetRoot)
+    $ErrorActionPreference = 'Continue'
+    foreach ($k in @('Control Panel\International', 'Keyboard Layout\Preload')) {
+        $null = & reg.exe delete "$TargetRoot\$k" /f 2>&1
+        $null = & reg.exe copy "$SourceRoot\$k" "$TargetRoot\$k" /s /f 2>&1
+        Write-Host ("reg copy {0}\{1} -> {2} : ExitCode {3}" -f $SourceRoot, $k, $TargetRoot, $LASTEXITCODE)
+    }
+    $null = & reg.exe add "$TargetRoot\Control Panel\Desktop" /v PreferredUILanguages /t REG_MULTI_SZ /d $Language /f 2>&1
+}
+
 # ==================================================================== Hauptteil
 try {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -287,9 +424,10 @@ try {
         catch { Write-Verbose ("Task {0}{1} nicht vorhanden/nicht deaktivierbar." -f $LciTaskPath, $n) }
     }
 
-    # --- 4) Idempotenz-Check ----------------------------------------------------
-    if (Test-LanguagePackInstalled -Lang $Language) {
-        Write-Host "Sprachpaket $Language bereits installiert - Installation wird uebersprungen."
+    # --- 4) Idempotenz-Check (LP + Pflicht-Features) ---------------------------
+    $langState = Get-LanguageState -Lang $Language
+    if ($langState.Complete) {
+        Write-Host "Sprachpaket $Language inkl. Features bereits installiert - Installation wird uebersprungen."
     }
     else {
         # --- 4a) Blockierende WU-/Servicing-Policies temporaer entschaerfen -------
@@ -336,20 +474,30 @@ try {
             }
             if (-not $finished) { Wait-ServicingIdle -MaxMinutes $ServicingIdleMaxMin }
 
-            $installed = Test-LanguagePackInstalled -Lang $Language
+            $langState = Get-LanguageState -Lang $Language
+            $installed = $langState.Complete
             if (-not $installed -and $attempt -lt $MaxAttempts) {
                 Write-Host ("Warte {0} Sekunden bis zum naechsten Versuch..." -f $RetryDelaySec)
                 Start-Sleep -Seconds $RetryDelaySec
             }
         } until ($installed -or $attempt -ge $MaxAttempts)
 
-        if (-not $installed) {
+        # --- 4e) Fehlende Features gezielt nachinstallieren ----------------------
+        if ($langState.LanguagePack -and -not $langState.Complete) {
+            Add-MissingLanguageFeature -Lang $Language -Features $langState.MissingFeatures -Deadline $deadline
+            $langState = Get-LanguageState -Lang $Language
+        }
+
+        if (-not $langState.Complete) {
             # Letzte CBS-Zeilen ins Transcript - spart eine RDP-Session zur Analyse.
             Write-Host '--- letzte 40 Zeilen C:\Windows\Logs\CBS\CBS.log ---'
             try { Get-Content 'C:\Windows\Logs\CBS\CBS.log' -Tail 40 -ErrorAction Stop | Write-Host } catch { Write-Verbose 'CBS.log nicht lesbar.' }
-            throw "Sprachpaket $Language konnte nicht installiert werden (WSUS/Proxy/CDN/Pending-Reboot pruefen; Log: $logPath)."
+            if (-not $langState.LanguagePack) {
+                throw "Sprachpaket $Language konnte nicht installiert werden (WSUS/Proxy/CDN/Pending-Reboot pruefen; Log: $logPath)."
+            }
+            throw ("Sprachpaket {0} installiert, aber Features fehlen: {1} (WSUS/Proxy/CDN pruefen; Log: {2})." -f $Language, ($langState.MissingFeatures -join ', '), $logPath)
         }
-        Write-Host "Sprachpaket $Language erfolgreich installiert."
+        Write-Host "Sprachpaket $Language inkl. Features erfolgreich installiert."
     }
 
     # --- 5) Systemweite Anzeigesprache ------------------------------------------
@@ -367,12 +515,16 @@ try {
 
     # --- 6) Sprache/Formate/Region des ausfuehrenden Kontos ---------------------
     # Als SYSTEM ist das HKU\.DEFAULT (Welcome Screen), als Admin dessen Profil. Beides ist nur die
-    # Quelle fuer Schritt 7. de-DE kommt an Position 1, vorhandene Sprachen (z. B. en-US) bleiben dahinter.
+    # Quelle fuer Schritt 7. de-DE kommt an Position 1; weitere Sprachen nur mit $KeepOtherLanguages.
     $langList = New-WinUserLanguageList -Language $Language
-    foreach ($l in (Get-WinUserLanguageList)) {
-        if ($l.LanguageTag -ne $Language) { $langList.Add($l) }
+    if ($KeepOtherLanguages) {
+        foreach ($l in (Get-WinUserLanguageList)) {
+            if ($l.LanguageTag -ne $Language) { $langList.Add($l) }
+        }
     }
     Set-WinUserLanguageList -LanguageList $langList -Force
+    try { Set-WinDefaultInputMethodOverride -InputTip $KeyboardId }
+    catch { Write-Warning ("Set-WinDefaultInputMethodOverride fehlgeschlagen: {0}" -f $_.Exception.Message) }
     # Setzt auch einen evtl. von v2 in HKU\.DEFAULT hinterlassenen en-US-Override auf de-DE.
     try { Set-WinUILanguageOverride -Language $Language }
     catch { Write-Warning ("Set-WinUILanguageOverride fehlgeschlagen: {0}" -f $_.Exception.Message) }
@@ -392,6 +544,32 @@ try {
         Write-Warning ("Copy-UserInternationalSettingsToSystem fehlgeschlagen: {0} - Fallback intl.cpl." -f $_.Exception.Message)
         Set-InternationalSettingsViaIntlCpl -Lang $Language -Geo $GeoId -Kbd $KeyboardId -WorkDir $tempFolder.FullName
     }
+
+    # --- 7b) Ergebnis pruefen: Welcome Screen und neue Benutzer -----------------
+    # Copy-UserInternationalSettingsToSystem meldet keinen Fehler, wenn es Werte nicht uebernimmt.
+    # Deshalb das Ergebnis direkt in den Ziel-Hives pruefen und notfalls nachziehen.
+    $srcRoot  = if ($isSystem) { 'HKU\.DEFAULT' } else { 'HKCU' }
+    $checkAll = {
+        $w = Test-IntlProfile -Root 'HKU\.DEFAULT' -Label 'Welcome Screen/Systemkonten'
+        $n = Invoke-WithDefaultUserHive { param($r) Test-IntlProfile -Root $r -Label 'Neue Benutzer (Default-Profil)' }
+        [pscustomobject]@{ Welcome = [bool]$w; NewUser = [bool]$n }
+    }
+    $chk = & $checkAll
+    if (-not ($chk.Welcome -and $chk.NewUser)) {
+        Write-Warning 'Einstellungen nicht vollstaendig uebernommen - Fallback intl.cpl.'
+        Set-InternationalSettingsViaIntlCpl -Lang $Language -Geo $GeoId -Kbd $KeyboardId -WorkDir $tempFolder.FullName
+        $chk = & $checkAll
+    }
+    if (-not ($chk.Welcome -and $chk.NewUser)) {
+        Write-Warning 'Weiterhin abweichend - direkte Registry-Kopie aus dem Quellprofil.'
+        if (-not $chk.Welcome -and -not $isSystem) { Copy-IntlRegistry -SourceRoot $srcRoot -TargetRoot 'HKU\.DEFAULT' }
+        if (-not $chk.NewUser) { [void](Invoke-WithDefaultUserHive { param($r) Copy-IntlRegistry -SourceRoot $srcRoot -TargetRoot $r }) }
+        $chk = & $checkAll
+    }
+    if (-not ($chk.Welcome -and $chk.NewUser)) {
+        throw ("Deutsche Standard-Einstellungen konnten nicht gesetzt werden (Welcome Screen={0}, Neue Benutzer={1})." -f $chk.Welcome, $chk.NewUser)
+    }
+    Write-Host "Welcome Screen und neue Benutzer: $Language geprueft OK."
 
     # --- 8) Sysprep-Vorpruefung -------------------------------------------------
     # Ein nur benutzerbezogen installiertes Language Experience Pack laesst Sysprep mit 0x80073CF2
@@ -420,8 +598,9 @@ try {
     Write-Host ("UserLanguageList  : {0}" -f ((Get-WinUserLanguageList).LanguageTag -join ', '))
     Write-Host ("MUI-UILanguages   : {0}" -f ((Get-ChildItem $MuiKey -ErrorAction SilentlyContinue).PSChildName -join ', '))
 
-    if (-not (Test-LanguagePackInstalled -Lang $Language)) {
-        throw "Abschlussvalidierung fehlgeschlagen: Sprachpaket $Language ist nicht installiert."
+    $langState = Get-LanguageState -Lang $Language
+    if (-not $langState.Complete) {
+        throw ("Abschlussvalidierung fehlgeschlagen: {0} unvollstaendig (LanguagePack={1}, fehlende Features=[{2}])." -f $Language, $langState.LanguagePack, ($langState.MissingFeatures -join ', '))
     }
     if (-not (Test-LanguageActive -Lang $Language)) {
         Write-Host "Hinweis: $Language ist installiert, die MUI-Registrierung erfolgt beim Neustart."
@@ -429,6 +608,7 @@ try {
     if (-not $sysUiOk) {
         Write-Warning "System Preferred UI Language konnte nicht gesetzt werden - nach dem Neustart Script erneut ausfuehren."
     }
+    Write-Host 'Hinweis (Microsoft): Nach einer Sprachpaket-Installation das aktuelle kumulative Update (LCU) erneut installieren, sonst bleiben Teile der Oberflaeche ggf. englisch.'
     Write-Host 'OK. Reboot erforderlich (via NERDIO ausloesen), erst danach ist Deutsch aktiv bzw. Sysprep/Image-Capture moeglich.'
 }
 catch {
