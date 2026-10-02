@@ -1,7 +1,22 @@
 
 ####################################################################   BEGIN INDIVIDUAL SCRIPT ######################################################################
-# Version: 2.0 - 20.08.2026
-#description: v2 - 20.08.2026
+# Version: 3.0 - 02.10.2026
+#description: v3 - de-DE Sprachpaket maschinenweit installieren und als Standard setzen (Win11 25H2+, NERDIO/SYSTEM oder Admin)
+#
+# Aenderungen v3 (Ursachen der unzuverlaessigen Laeufe in v2):
+#  - Tasks LanguageComponentsInstaller\Installation + ReconcileLanguageResources werden WAEHREND der
+#    Installation deaktiviert und danach wieder aktiviert (MS-Bug ERROR_SHARING_VIOLATION, vgl.
+#    Azure/RDS-Templates InstallLanguagePacks.ps1). v2 hat ReconcileLanguageResources dauerhaft deaktiviert.
+#  - Erfolgspruefung akzeptiert "installiert, Reboot ausstehend". v2 verlangte den MUI-Schluessel, der
+#    teils erst nach dem Neustart existiert -> Fehlalarm, 3 unnoetige Versuche, Abbruch.
+#  - SYSTEM-Erkennung per SID statt Kontoname (auf deutschem OS heisst es "NT-AUTORITAET\SYSTEM").
+#  - Set-Service auf geschuetzte Dienste (DoSvc) bricht das Script nicht mehr ab.
+#  - Servicing-Policy UseWindowsUpdate=2 ("nie von WU laden", Ursache 0x800F0954) wird temporaer entfernt.
+#  - Nach Timeout wird auf Ende der laufenden CBS-Operation gewartet statt parallel neu zu starten;
+#    Gesamtbudget bleibt unter dem 90-Min-Limit der Custom Script Extension.
+#  - Deutsch als Standard fuer System, Welcome Screen und neue Benutzer (Set-SystemPreferredUILanguage
+#    + Copy-UserInternationalSettingsToSystem). v2 setzte Welcome Screen/SYSTEM bewusst auf en-US.
+#  - Fehler werden vor dem Abbruch ins Log geschrieben (v2: erst nach Stop-Transcript -> fehlte im Log).
 
 # ---------------------------------------------------------------- Logging-Header
 $scriptName = "CDT_Install_German_Language"
@@ -10,13 +25,14 @@ $savedVerbosePreference = $VerbosePreference
 $VerbosePreference = "Continue"
 $savedErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Stop"
+$savedProgressPreference = $ProgressPreference
+$ProgressPreference = "SilentlyContinue"        # kein Fortschrittsbalken im nicht-interaktiven Host
 $logTime = ((Get-Date).ToUniversalTime()).ToString("yyyy-MM-dd HH:mm:ss")
 $logFolder = New-Item -Path "C:\Windows\Temp\NMWLogs" -ItemType Directory -Name "ScriptedActions" -Force
 $tempFolder = New-Item -Path "C:\Windows\Temp" -ItemType Directory -Name $scriptName -Force
 $logPath = Join-Path $logFolder.FullName $logFileName
 
-# FIX #11: Transcript darf nicht hart fehlschlagen, wenn der HYDRA-Wrapper bereits
-#          eine Transkription gestartet hat ("Transcription has already been started").
+# Transcript darf nicht hart fehlschlagen, wenn ein Wrapper bereits eine Transkription gestartet hat.
 $transcriptStarted = $false
 try {
     Start-Transcript -Path $logPath -Append | Out-Null
@@ -30,100 +46,154 @@ Write-Host "Current time (UTC-0): $logTime"
 Write-Host "Log: $logPath"
 
 # ===== Konfiguration =============================================================
-$Language        = 'de-DE'                    # BCP-47 Zielsprache
-$FallbackUILang  = 'en-US'                    # bleibt in der Sprachliste + MUI-Fallback
-$SystemUILang    = 'en-US'                    # Anzeigesprache SYSTEM / Welcome Screen
-$GeoId           = 94                         # Deutschland
-$TimeZone        = 'W. Europe Standard Time'  # Berlin inkl. Sommerzeit
-$KeyboardId      = '0407:00000407'            # de-DE / Deutsch (QWERTZ)
-$MaxAttempts     = 3
-$RetryDelaySec   = 120
-$InstallTimeoutMin = 25                       # Hard-Timeout je Install-Versuch
-$SetHandwriting  = $false                     # FIX #13: auf Multi-Session nutzlos, kostet FoD-Payload
+$Language            = 'de-DE'                    # BCP-47 Zielsprache (Anzeige, Formate, Systemgebietsschema)
+$GeoId               = 94                         # Deutschland
+$TimeZone            = 'W. Europe Standard Time'  # Berlin inkl. Sommerzeit
+$KeyboardId          = '0407:00000407'            # de-DE / Deutsch (QWERTZ), nur fuer intl.cpl-Fallback
+$MaxAttempts         = 3
+$RetryDelaySec       = 60
+$InstallTimeoutMin   = 25                         # Hard-Timeout je Install-Versuch
+$ServicingIdleMaxMin = 10                         # nach Timeout: max. Wartezeit auf Ende der CBS-Operation
+$InstallBudgetMin    = 70                         # Gesamtbudget Installation (CSE-Limit: 90 Min.)
 # =================================================================================
 
 # ---------------------------------------------------------------- Registry-Konstanten
-$AUKey       = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
-$WUKey       = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-$ServicingKey= 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Servicing'
-$IntlPolKey  = 'HKLM:\SOFTWARE\Policies\Microsoft\Control Panel\International'
-$MuiKey      = 'HKLM:\SYSTEM\CurrentControlSet\Control\MUI\UILanguages'
+$AUKey        = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+$WUKey        = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+$ServicingKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Servicing'
+$IntlPolKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Control Panel\International'
+$MuiKey       = 'HKLM:\SYSTEM\CurrentControlSet\Control\MUI\UILanguages'
+$DefaultGeoKey= 'Registry::HKEY_USERS\.DEFAULT\Control Panel\International\Geo'
+
+$LciTaskPath  = '\Microsoft\Windows\LanguageComponentsInstaller\'
 
 # Merker fuer garantierte Wiederherstellung im finally-Block
-$RegRestore = New-Object System.Collections.ArrayList   # @{Path;Name;Value;Existed}
-$SvcRestore = New-Object System.Collections.ArrayList   # @{Name;StartType}
+$RegRestore   = New-Object System.Collections.ArrayList   # @{Path;Name;Value}  Value $null = war nicht gesetzt
+$SvcRestore   = New-Object System.Collections.ArrayList   # @{Name;StartType}
+$TaskReenable = New-Object System.Collections.ArrayList   # Tasknamen unter $LciTaskPath
 
 # ================================================================ Hilfsfunktionen
 function Set-PolicyValueTemporarily {
-    param([string]$Path, [string]$Name, [int]$DesiredValue)
-    # Setzt einen Policy-Wert nur dann, wenn er aktuell blockierend ist, und merkt
-    # sich den Originalzustand fuer das Rollback im finally-Block.
-    if (-not (Test-Path $Path)) { return }
-    $cur = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
-    if ($null -eq $cur) { return }
-    if ([int]$cur -eq $DesiredValue) { return }
-    Write-Host ("Policy-Bypass: {0}\{1} : {2} -> {3}" -f $Path, $Name, $cur, $DesiredValue)
-    [void]$RegRestore.Add(@{ Path = $Path; Name = $Name; Value = [int]$cur })
-    Set-ItemProperty -Path $Path -Name $Name -Value $DesiredValue -Type DWord
+    # Setzt einen DWORD-Policy-Wert (bzw. entfernt ihn bei $DesiredValue = $null) und merkt sich den
+    # Originalzustand fuer das Rollback im finally-Block. -OnlyIfPresent: nur aendern, wenn gesetzt.
+    param([string]$Path, [string]$Name, $DesiredValue, [switch]$OnlyIfPresent)
+    $cur = $null
+    if (Test-Path $Path) { $cur = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name }
+    if ($OnlyIfPresent -and $null -eq $cur) { return }
+    if ($null -eq $DesiredValue) { if ($null -eq $cur) { return } }
+    elseif ($null -ne $cur -and [int]$cur -eq [int]$DesiredValue) { return }
+
+    $curText = if ($null -eq $cur) { '<nicht gesetzt>' } else { $cur }
+    $newText = if ($null -eq $DesiredValue) { '<entfernt>' } else { $DesiredValue }
+    Write-Host ("Policy-Bypass: {0}\{1} : {2} -> {3}" -f $Path, $Name, $curText, $newText)
+    [void]$RegRestore.Add(@{ Path = $Path; Name = $Name; Value = $cur })
+    if ($null -eq $DesiredValue) {
+        Remove-ItemProperty -Path $Path -Name $Name
+    }
+    else {
+        if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+        Set-ItemProperty -Path $Path -Name $Name -Value ([int]$DesiredValue) -Type DWord
+    }
 }
 
 function Enable-ServiceTemporarily {
+    # Install-Language braucht wuauserv und DoSvc (Delivery Optimization = CDN-Transport).
+    # DoSvc ist ein geschuetzter Dienst: Set-Service liefert dort teils "Zugriff verweigert".
+    # Das darf das Script NICHT abbrechen (v2: ungefangener Fehler -> Gesamtabbruch).
     param([string]$Name)
-    # FIX #5: Install-Language braucht wuauserv UND DoSvc. Auf gehaerteten AVD-Images
-    # sind beide oft "Disabled" -> Restart-Service wirft (ErrorAction Stop) und/oder
-    # der CDN-Download scheitert mit 0x8024402C / 0x80240438.
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { Write-Warning ("Dienst {0} nicht vorhanden." -f $Name); return }
-    $wmi = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $Name) -ErrorAction SilentlyContinue
-    if ($wmi -and $wmi.StartMode -eq 'Disabled') {
-        Write-Host ("Dienst {0} ist Disabled - temporaer auf Manual gesetzt." -f $Name)
-        [void]$SvcRestore.Add(@{ Name = $Name; StartType = 'Disabled' })
-        Set-Service -Name $Name -StartupType Manual
-    }
     try {
+        if ($svc.StartType -eq 'Disabled') {
+            Set-Service -Name $Name -StartupType Manual
+            [void]$SvcRestore.Add(@{ Name = $Name; StartType = 'Disabled' })
+            Write-Host ("Dienst {0} war Disabled - temporaer auf Manual gesetzt." -f $Name)
+        }
         if ((Get-Service -Name $Name).Status -ne 'Running') { Start-Service -Name $Name }
+        Write-Host ("Dienst {0}: {1}" -f $Name, (Get-Service -Name $Name).Status)
     }
-    catch { Write-Warning ("Dienst {0} konnte nicht gestartet werden: {1}" -f $Name, $_.Exception.Message) }
+    catch { Write-Warning ("Dienst {0} konnte nicht aktiviert/gestartet werden: {1}" -f $Name, $_.Exception.Message) }
 }
 
-function Test-LanguageReady {
+function Test-LanguagePackInstalled {
+    # $true, wenn das maschinenweite Language Pack (CBS-LP) installiert ist - auch wenn der Neustart
+    # noch aussteht. Nur Features (BasicTyping, ...) oder nur das benutzerbezogene LXP zaehlen NICHT
+    # (Teilinstallation, Fehlerbild 0x800F0991).
     param([string]$Lang)
-    # FIX #3: Get-InstalledLanguage meldet die Sprache bereits als "installiert",
-    # wenn nur Teilkomponenten da sind (Fehlerbild 0x800F0991 "partially installed").
-    # Harter Nachweis, dass die ANZEIGESPRACHE wirklich nutzbar ist:
-    # der MUI-Schluessel existiert nur bei vollstaendig installiertem Language Pack.
-    $inList = $false
-    try { $inList = [bool](Get-InstalledLanguage -ErrorAction Stop | Where-Object { $_.LanguageId -eq $Lang }) } catch { }
-    $muiOk = Test-Path (Join-Path $MuiKey $Lang)
-    Write-Verbose ("Test-LanguageReady {0}: Get-InstalledLanguage={1}, MUI-Key={2}" -f $Lang, $inList, $muiOk)
-    return ($inList -and $muiOk)
+    try {
+        $il = Get-InstalledLanguage -ErrorAction Stop | Where-Object { $_.LanguageId -eq $Lang }
+        if ($il) { Write-Host ("Get-InstalledLanguage {0}: Packs=[{1}] Features=[{2}]" -f $Lang, $il.LanguagePacks, $il.LanguageFeatures) }
+        if ($il -and ("$($il.LanguagePacks)" -match 'LpCab')) { return $true }
+    }
+    catch { Write-Warning ("Get-InstalledLanguage fehlgeschlagen: {0}" -f $_.Exception.Message) }
+
+    # Fallback: CBS-Paketstatus. 'InstallPending' = installiert, wird beim Neustart abgeschlossen.
+    try {
+        $pkg = Get-WindowsPackage -Online -ErrorAction Stop | Where-Object {
+            $_.PackageName -like '*Client-Language-Pack*' -and $_.PackageName -like "*$Lang*" -and
+            @('Installed', 'InstallPending') -contains "$($_.PackageState)"
+        } | Select-Object -First 1
+        if ($pkg) { Write-Host ("CBS-Paket: {0} ({1})" -f $pkg.PackageName, $pkg.PackageState); return $true }
+    }
+    catch { Write-Warning ("Get-WindowsPackage fehlgeschlagen: {0}" -f $_.Exception.Message) }
+    return $false
+}
+
+function Test-LanguageActive {
+    # MUI-Registrierung = Anzeigesprache sofort nutzbar. Fehlt sie bei installiertem LP -> Reboot ausstehend.
+    param([string]$Lang)
+    return (Test-Path (Join-Path $MuiKey $Lang))
 }
 
 function Invoke-InstallLanguageWithTimeout {
+    # Install-Language kann haengen (WU-Client blockiert). -AsJob + Wait-Job erzwingt einen Abbruch,
+    # bevor der Timeout der Scripted Action greift. Rueckgabe: $true = beendet, $false = Timeout.
     param([string]$Lang, [int]$TimeoutMinutes)
-    # FIX #6: Install-Language kann unbegrenzt haengen (WU-Client blockiert).
-    # Ohne Timeout laeuft der 1. Versuch in den HYDRA-Script-Timeout und die
-    # Retry-Schleife greift nie. -AsJob + Wait-Job erzwingt den Abbruch.
     $job = Install-Language -Language $Lang -AsJob
     $done = Wait-Job -Job $job -Timeout ($TimeoutMinutes * 60)
     if (-not $done) {
         Write-Warning ("Install-Language ueberschreitet {0} Minuten - Versuch wird abgebrochen." -f $TimeoutMinutes)
         Stop-Job -Job $job -ErrorAction SilentlyContinue
         Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        return
+        return $false
     }
     try { Receive-Job -Job $job -ErrorAction Stop | Out-String | Write-Host }
     finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+    return $true
+}
+
+function Wait-ServicingIdle {
+    # Ein gestoppter Job beendet die CBS-Operation (TiWorker) nicht zwingend. Ein sofortiger neuer
+    # Install-Language-Aufruf wuerde mit ihr kollidieren -> erst auf Ende warten (begrenzt).
+    param([int]$MaxMinutes)
+    $deadline = (Get-Date).AddMinutes($MaxMinutes)
+    while ((Get-Process -Name TiWorker -ErrorAction SilentlyContinue) -and ((Get-Date) -lt $deadline)) {
+        Write-Host 'CBS (TiWorker) noch aktiv - warte 30 Sekunden...'
+        Start-Sleep -Seconds 30
+    }
+}
+
+function Test-TcpPort {
+    param([string]$HostName, [int]$Port = 443, [int]$TimeoutMs = 5000)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $client.EndConnect($iar)
+        return $true
+    }
+    catch { return $false }
+    finally { $client.Close() }
 }
 
 function Set-InternationalSettingsViaIntlCpl {
-    param([string]$Lang, [int]$Geo, [string]$Kbd, [string]$Fallback, [string]$WorkDir)
-    # FIX #1: Windows-10-Pfad. Copy-UserInternationalSettingsToSystem gibt es dort
-    # NICHT (Windows 11 22000+ only). intl.cpl /f:<xml> funktioniert auf Win10 UND Win11.
+    # Fallback, falls Copy-UserInternationalSettingsToSystem fehlschlaegt.
+    # intl.cpl /f:<xml> kopiert die Einstellungen auf Welcome Screen/Systemkonten und Default-Profil.
+    param([string]$Lang, [int]$Geo, [string]$Kbd, [string]$WorkDir)
     $xml = @"
 <gs:GlobalizationServices xmlns:gs="urn:longhornGlobalizationUnattend">
   <gs:UserList>
-    <gs:User UserID="Current" CopySettingsToDefaultUserAcct="true" CopySettingsToSystemAcct="false"/>
+    <gs:User UserID="Current" CopySettingsToDefaultUserAcct="true" CopySettingsToSystemAcct="true"/>
   </gs:UserList>
   <gs:UserLocale>
     <gs:Locale Name="$Lang" SetAsCurrent="true" ResetAllSettings="false"/>
@@ -133,7 +203,6 @@ function Set-InternationalSettingsViaIntlCpl {
   </gs:LocationPreferences>
   <gs:MUILanguagePreferences>
     <gs:MUILanguage Value="$Lang"/>
-    <gs:MUIFallback Value="$Fallback"/>
   </gs:MUILanguagePreferences>
   <gs:InputPreferences>
     <gs:InputLanguageID Action="add" ID="$Kbd" Default="true"/>
@@ -151,167 +220,198 @@ function Set-InternationalSettingsViaIntlCpl {
 
 # ==================================================================== Hauptteil
 try {
-    $ctx = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $isSystem = ($ctx -eq 'NT AUTHORITY\SYSTEM')
-    $os = Get-CimInstance Win32_OperatingSystem
-    $build = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
-    $isWin11 = $build -ge 22000
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $ctx      = $identity.Name
+    $isSystem = ($identity.User.Value -eq 'S-1-5-18')    # SID statt Name: Kontoname ist lokalisiert
+    $isAdmin  = ([System.Security.Principal.WindowsPrincipal]$identity).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    $os       = Get-CimInstance Win32_OperatingSystem -Verbose:$false
+    $build    = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').CurrentBuildNumber
 
-    Write-Host ("Ausfuehrungskontext : {0} (SYSTEM={1})" -f $ctx, $isSystem)
-    Write-Host ("Betriebssystem      : {0} (Build {1}, Win11={2})" -f $os.Caption, $build, $isWin11)
-    Write-Host ("PowerShell          : {0}" -f $PSVersionTable.PSVersion)
+    Write-Host ("Ausfuehrungskontext : {0} (SYSTEM={1}, Admin={2})" -f $ctx, $isSystem, $isAdmin)
+    Write-Host ("Betriebssystem      : {0} (Build {1})" -f $os.Caption, $build)
+    Write-Host ("PowerShell          : {0} ({1}, 64-Bit-Prozess={2})" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, [Environment]::Is64BitProcess)
 
-    # FIX #12: PowerShell 7 wird von den International-/LanguagePackManagement-Cmdlets
-    # nicht zuverlaessig unterstuetzt. Frueh und klar abbrechen statt kryptisch scheitern.
+    # --- 0) Voraussetzungen -----------------------------------------------------
+    if (-not $isSystem -and -not $isAdmin) {
+        throw "Script muss als SYSTEM (NERDIO) oder in einer erhoehten Admin-Sitzung laufen."
+    }
+    # International-/LanguagePackManagement-Cmdlets sind unter PowerShell 7 nicht zuverlaessig.
     if ($PSVersionTable.PSEdition -eq 'Core') {
-        throw "Dieses Script muss unter Windows PowerShell 5.1 laufen (aktuell: PowerShell $($PSVersionTable.PSVersion)). In HYDRA/NERDIO die Scripted Action auf powershell.exe (nicht pwsh.exe) stellen."
+        throw "Dieses Script muss unter Windows PowerShell 5.1 laufen (aktuell: PowerShell $($PSVersionTable.PSVersion)). Scripted Action auf powershell.exe (nicht pwsh.exe) stellen."
+    }
+    # 32-Bit-Host (SysWOW64) findet das Modul LanguagePackManagement nicht.
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        throw "Script laeuft in 32-Bit-PowerShell. Bitte 64-Bit-powershell.exe verwenden (z. B. %WINDIR%\SysNative\WindowsPowerShell\v1.0\powershell.exe)."
+    }
+    if ($build -lt 22000) {
+        throw "Windows 11 erforderlich (Build $build). Copy-UserInternationalSettingsToSystem gibt es erst ab Build 22000."
+    }
+    if ($build -lt 26200) {
+        Write-Warning "Build $build liegt unter Windows 11 25H2 (26200). Script ist fuer 25H2+ ausgelegt."
     }
     if (-not (Get-Module -ListAvailable -Name LanguagePackManagement)) {
-        throw "Modul 'LanguagePackManagement' nicht verfuegbar (Build $build). Erfordert Windows 10 21H2+/Windows 11. Fuer aeltere Builds ist der DISM-/FoD-ISO-Weg noetig."
+        throw "Modul 'LanguagePackManagement' nicht verfuegbar (Build $build)."
     }
-    Import-Module LanguagePackManagement -ErrorAction Stop
+    Import-Module LanguagePackManagement -ErrorAction Stop -Verbose:$false
 
     # --- 1) Pending-Reboot-Check ------------------------------------------------
     $pendingReboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
                      (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
                      ($null -ne (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue))
     if ($pendingReboot) {
-        Write-Warning 'Ausstehender Neustart erkannt - Install-Language kann mit 0x800F0923/0x80070bc2 scheitern. Empfehlung: Reboot-Step VOR dieses Script legen.'
+        Write-Warning 'Ausstehender Neustart erkannt - Install-Language kann mit 0x800F0922/0x80070BC2 scheitern. Empfehlung: Reboot-Step VOR dieses Script legen.'
     }
 
-    # --- 2) LangPack-Bereinigung deaktivieren (AVD Best Practice) ---------------
+    # --- 2) LangPack-Bereinigung dauerhaft deaktivieren (AVD Best Practice) ------
     New-Item -Path $IntlPolKey -Force | Out-Null
     Set-ItemProperty -Path $IntlPolKey -Name 'BlockCleanupOfUnusedPreinstalledLangPacks' -Value 1 -Type DWord
     foreach ($t in @(
-        @{ P = '\Microsoft\Windows\AppxDeploymentClient\';        N = 'Pre-staged app cleanup' },
-        @{ P = '\Microsoft\Windows\MUI\';                          N = 'LPRemove' },
-        @{ P = '\Microsoft\Windows\LanguageComponentsInstaller\';  N = 'Uninstallation' },
-        @{ P = '\Microsoft\Windows\LanguageComponentsInstaller\';  N = 'ReconcileLanguageResources' }   # FIX #14
+        @{ P = '\Microsoft\Windows\AppxDeploymentClient\'; N = 'Pre-staged app cleanup' },
+        @{ P = '\Microsoft\Windows\MUI\';                   N = 'LPRemove' },
+        @{ P = $LciTaskPath;                                N = 'Uninstallation' }
     )) {
         try { Disable-ScheduledTask -TaskPath $t.P -TaskName $t.N -ErrorAction Stop | Out-Null; Write-Host ("Task deaktiviert: {0}{1}" -f $t.P, $t.N) }
         catch { Write-Verbose ("Task {0}{1} nicht vorhanden/nicht deaktivierbar." -f $t.P, $t.N) }
     }
 
-    # --- 3) Idempotenz-Check (hart) ---------------------------------------------
-    if (Test-LanguageReady -Lang $Language) {
-        Write-Host "Sprachpaket $Language vollstaendig vorhanden - Installation wird uebersprungen."
+    # --- 3) LanguageComponentsInstaller waehrend des Laufs pausieren -------------
+    # Laufen diese Tasks parallel zu Install-Language, scheitert die Installation sporadisch mit
+    # ERROR_SHARING_VIOLATION (0x80070020). Reaktivierung im finally-Block (wie MS-Referenzscript).
+    foreach ($n in @('Installation', 'ReconcileLanguageResources')) {
+        try {
+            Stop-ScheduledTask    -TaskPath $LciTaskPath -TaskName $n -ErrorAction SilentlyContinue
+            Disable-ScheduledTask -TaskPath $LciTaskPath -TaskName $n -ErrorAction Stop | Out-Null
+            [void]$TaskReenable.Add($n)
+            Write-Host ("Task temporaer deaktiviert: {0}{1}" -f $LciTaskPath, $n)
+        }
+        catch { Write-Verbose ("Task {0}{1} nicht vorhanden/nicht deaktivierbar." -f $LciTaskPath, $n) }
+    }
+
+    # --- 4) Idempotenz-Check ----------------------------------------------------
+    if (Test-LanguagePackInstalled -Lang $Language) {
+        Write-Host "Sprachpaket $Language bereits installiert - Installation wird uebersprungen."
     }
     else {
-        # --- 4) Blockierende WU-/Servicing-Policies temporaer entschaerfen -------
-        Set-PolicyValueTemporarily -Path $AUKey -Name 'UseWUServer' -DesiredValue 0
-        Set-PolicyValueTemporarily -Path $WUKey -Name 'DoNotConnectToWindowsUpdateInternetLocations' -DesiredValue 0
-        Set-PolicyValueTemporarily -Path $WUKey -Name 'DisableWindowsUpdateAccess' -DesiredValue 0          # FIX #4
-        # FIX #4: DIE klassische 0x800F0954-Ursache bei FoD/Language Packs -
-        # GPO "Specify settings for optional component installation and component repair".
-        # 2 = Repair-Content direkt von Windows Update laden.
-        if (-not (Test-Path $ServicingKey)) { New-Item -Path $ServicingKey -Force | Out-Null }
-        $curRepair = (Get-ItemProperty -Path $ServicingKey -Name 'RepairContentServerSource' -ErrorAction SilentlyContinue).RepairContentServerSource
-        if ([int]$curRepair -ne 2) {
-            Write-Host ("Servicing-Policy RepairContentServerSource: {0} -> 2" -f $curRepair)
-            [void]$RegRestore.Add(@{ Path = $ServicingKey; Name = 'RepairContentServerSource'; Value = $curRepair })
-            Set-ItemProperty -Path $ServicingKey -Name 'RepairContentServerSource' -Value 2 -Type DWord
-        }
+        # --- 4a) Blockierende WU-/Servicing-Policies temporaer entschaerfen -------
+        Set-PolicyValueTemporarily -Path $AUKey -Name 'UseWUServer' -DesiredValue 0 -OnlyIfPresent
+        Set-PolicyValueTemporarily -Path $WUKey -Name 'DoNotConnectToWindowsUpdateInternetLocations' -DesiredValue 0 -OnlyIfPresent
+        Set-PolicyValueTemporarily -Path $WUKey -Name 'DisableWindowsUpdateAccess' -DesiredValue 0 -OnlyIfPresent
+        # GPO "Einstellungen fuer die Installation optionaler Komponenten und die Komponentenreparatur":
+        # UseWindowsUpdate=2 verbietet WU als Quelle, RepairContentServerSource=2 laedt direkt von WU
+        # statt WSUS. Beides ist die klassische Ursache fuer 0x800F0954 bei Language Packs.
+        Set-PolicyValueTemporarily -Path $ServicingKey -Name 'UseWindowsUpdate' -DesiredValue $null -OnlyIfPresent
+        Set-PolicyValueTemporarily -Path $ServicingKey -Name 'RepairContentServerSource' -DesiredValue 2
 
         # --- 4b) Dienste sicherstellen ------------------------------------------
         Enable-ServiceTemporarily -Name 'wuauserv'
-        Enable-ServiceTemporarily -Name 'DoSvc'      # Delivery Optimization = CDN-Transport
-        try { Restart-Service wuauserv -Force } catch { Write-Warning ("wuauserv-Neustart fehlgeschlagen: {0}" -f $_.Exception.Message) }
+        Enable-ServiceTemporarily -Name 'DoSvc'
+        if ($RegRestore.Count -gt 0) {
+            # Nur bei geaenderten Policies neu starten, damit der WU-Client sie neu einliest.
+            try { Restart-Service wuauserv -Force } catch { Write-Warning ("wuauserv-Neustart fehlgeschlagen: {0}" -f $_.Exception.Message) }
+        }
 
-        # --- 4c) Konnektivitaets-Vorpruefung (Azure Local / Proxy) --------------
-        # FIX #10: In Azure-Local-/Proxy-Umgebungen ist der WinHTTP-Proxy fuer SYSTEM
-        # oft nicht gesetzt -> Install-Language scheitert stumm mit 0x8024402C.
+        # --- 4c) Konnektivitaets-Vorpruefung (nur Diagnose) ---------------------
         Write-Host ("WinHTTP-Proxy: {0}" -f ((netsh winhttp show proxy) -join ' ').Trim())
-        $cdnOk = Test-NetConnection -ComputerName 'tlu.dl.delivery.mp.microsoft.com' -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
-        Write-Host ("CDN erreichbar (tlu.dl.delivery.mp.microsoft.com:443): {0}" -f $cdnOk)
-        if (-not $cdnOk) { Write-Warning 'Windows-Update-CDN nicht erreichbar - Install-Language wird sehr wahrscheinlich scheitern (Firewall/Proxy/NSG pruefen).' }
+        $cdnHost = 'tlu.dl.delivery.mp.microsoft.com'
+        $cdnOk = Test-TcpPort -HostName $cdnHost -Port 443
+        Write-Host ("CDN erreichbar ({0}:443): {1}" -f $cdnHost, $cdnOk)
+        if (-not $cdnOk) { Write-Warning 'Windows-Update-CDN direkt nicht erreichbar - bei Fehlschlag Firewall/Proxy/NSG pruefen.' }
 
-        # --- 5) Installation mit begrenzter Retry-Schleife + Timeout ------------
-        $attempt = 0
+        # --- 4d) Installation mit Retry, Timeout und Gesamtbudget ----------------
+        $deadline  = (Get-Date).AddMinutes($InstallBudgetMin)
+        $attempt   = 0
+        $installed = $false
         do {
             $attempt++
-            Write-Host ("Install-Language {0} - Versuch {1}/{2} (Timeout {3} Min.)..." -f $Language, $attempt, $MaxAttempts, $InstallTimeoutMin)
-            try { Invoke-InstallLanguageWithTimeout -Lang $Language -TimeoutMinutes $InstallTimeoutMin }
+            $remainingMin = [int][Math]::Floor(($deadline - (Get-Date)).TotalMinutes)
+            if ($remainingMin -lt 5) { Write-Warning 'Installationsbudget aufgebraucht - keine weiteren Versuche.'; break }
+            $timeoutMin = [Math]::Min($InstallTimeoutMin, $remainingMin)
+            Write-Host ("Install-Language {0} - Versuch {1}/{2} (Timeout {3} Min.)..." -f $Language, $attempt, $MaxAttempts, $timeoutMin)
+
+            $finished = $true
+            try { $finished = Invoke-InstallLanguageWithTimeout -Lang $Language -TimeoutMinutes $timeoutMin }
             catch {
-                # FIX #7: HResult mitloggen - die Message allein ist fuer die Diagnose wertlos.
+                # HResult mitloggen - die Message allein ist fuer die Diagnose oft wertlos.
                 Write-Warning ("Versuch {0} fehlgeschlagen: {1} (HResult 0x{2:X8})" -f $attempt, $_.Exception.Message, $_.Exception.HResult)
             }
-            $ok = Test-LanguageReady -Lang $Language
-            if (-not $ok -and $attempt -lt $MaxAttempts) {
+            if (-not $finished) { Wait-ServicingIdle -MaxMinutes $ServicingIdleMaxMin }
+
+            $installed = Test-LanguagePackInstalled -Lang $Language
+            if (-not $installed -and $attempt -lt $MaxAttempts) {
                 Write-Host ("Warte {0} Sekunden bis zum naechsten Versuch..." -f $RetryDelaySec)
                 Start-Sleep -Seconds $RetryDelaySec
             }
-        } until ($ok -or $attempt -ge $MaxAttempts)
+        } until ($installed -or $attempt -ge $MaxAttempts)
 
-        if (-not $ok) {
-            # FIX #7b: letzte CBS-Zeilen ins Transcript - spart eine RDP-Session zur Analyse.
-            try {
-                Write-Host '--- letzte 40 Zeilen C:\Windows\Logs\CBS\CBS.log ---'
-                Get-Content 'C:\Windows\Logs\CBS\CBS.log' -Tail 40 -ErrorAction SilentlyContinue | Write-Host
-            } catch { }
-            throw "Sprachpaket $Language konnte nach $MaxAttempts Versuchen nicht vollstaendig installiert werden (WSUS/Proxy/CDN/Pending-Reboot pruefen; Log: $logPath)."
+        if (-not $installed) {
+            # Letzte CBS-Zeilen ins Transcript - spart eine RDP-Session zur Analyse.
+            Write-Host '--- letzte 40 Zeilen C:\Windows\Logs\CBS\CBS.log ---'
+            try { Get-Content 'C:\Windows\Logs\CBS\CBS.log' -Tail 40 -ErrorAction Stop | Write-Host } catch { Write-Verbose 'CBS.log nicht lesbar.' }
+            throw "Sprachpaket $Language konnte nicht installiert werden (WSUS/Proxy/CDN/Pending-Reboot pruefen; Log: $logPath)."
         }
         Write-Host "Sprachpaket $Language erfolgreich installiert."
     }
 
-    # --- 6) Eingabesprache / Formate / Region / Zeitzone -------------------------
-    # FIX #2: New-WinUserLanguageList ERSETZT die Liste komplett. Im Original flog
-    # damit en-US raus - danach war "Set-WinUILanguageOverride -Language en-US"
-    # auf eine Sprache gerichtet, die nicht mehr in der Praeferenzliste stand.
+    # --- 5) Systemweite Anzeigesprache ------------------------------------------
+    # Setzt die System Preferred UI Language (Welcome Screen, Systemkonten, Standard fuer neue
+    # Benutzer). Wirksam nach Neustart.
+    $sysUiOk = $false
+    try {
+        Set-SystemPreferredUILanguage -Language $Language
+        $sysUiOk = $true
+        Write-Host "System Preferred UI Language: $Language"
+    }
+    catch {
+        Write-Warning ("Set-SystemPreferredUILanguage fehlgeschlagen: {0} - Welcome Screen/neue Benutzer werden trotzdem ueber Schritt 7 auf {1} gesetzt. Nach dem Neustart Script erneut ausfuehren." -f $_.Exception.Message, $Language)
+    }
+
+    # --- 6) Sprache/Formate/Region des ausfuehrenden Kontos ---------------------
+    # Als SYSTEM ist das HKU\.DEFAULT (Welcome Screen), als Admin dessen Profil. Beides ist nur die
+    # Quelle fuer Schritt 7. de-DE kommt an Position 1, vorhandene Sprachen (z. B. en-US) bleiben dahinter.
     $langList = New-WinUserLanguageList -Language $Language
-    if ($SetHandwriting) { $langList[0].Handwriting = $true }
-    if ($FallbackUILang -and $FallbackUILang -ne $Language) { $langList.Add($FallbackUILang) }
+    foreach ($l in (Get-WinUserLanguageList)) {
+        if ($l.LanguageTag -ne $Language) { $langList.Add($l) }
+    }
     Set-WinUserLanguageList -LanguageList $langList -Force
-    Set-Culture         -CultureInfo  $Language
+    # Setzt auch einen evtl. von v2 in HKU\.DEFAULT hinterlassenen en-US-Override auf de-DE.
+    try { Set-WinUILanguageOverride -Language $Language }
+    catch { Write-Warning ("Set-WinUILanguageOverride fehlgeschlagen: {0}" -f $_.Exception.Message) }
+    Set-Culture        -CultureInfo  $Language
     Set-WinSystemLocale -SystemLocale $Language     # Nicht-Unicode-Programme, wirkt nach Reboot
     Set-WinHomeLocation -GeoId        $GeoId
+    if (-not (Test-Path $DefaultGeoKey)) { New-Item -Path $DefaultGeoKey -Force | Out-Null }
+    Set-ItemProperty -Path $DefaultGeoKey -Name 'Nation' -Value ([string]$GeoId) -Type String
     Set-TimeZone        -Id           $TimeZone
 
-    # --- 7) Anzeigesprache: SYSTEM/Welcome = en-US, neue Profile = de-DE --------
-    # FIX #8 (Kernfehler des Originals): Unter SYSTEM ist HKCU identisch mit
-    # HKU\.DEFAULT - also exakt der Welcome-Screen-/Systemkonto-Hive.
-    # Im Original blieb der LETZTE Aufruf "Set-WinUILanguageOverride -Language de-DE"
-    # stehen => der Welcome Screen wurde deutsch, obwohl en-US gewollt war,
-    # und der erste Copy-Aufruf (-WelcomeScreen $true) war ein reiner Self-Copy.
-    if ($isWin11) {
-        Set-WinUILanguageOverride -Language $Language
-        Copy-UserInternationalSettingsToSystem -WelcomeScreen $false -NewUser $true
-        Write-Host 'Neue Benutzerprofile: de-DE (Copy-UserInternationalSettingsToSystem -NewUser).'
-        if ($isSystem) {
-            # HKU\.DEFAULT wieder auf en-US zuruecksetzen -> Welcome Screen/SYSTEM bleibt englisch
-            Set-WinUILanguageOverride -Language $SystemUILang
-            Write-Host "SYSTEM/Welcome Screen: $SystemUILang (HKU\.DEFAULT zurueckgesetzt)."
-        }
-        else {
-            Write-Warning "Script laeuft NICHT als SYSTEM ($ctx). Die Einstellungen liegen im Profil '$ctx' und gehen bei Sysprep verloren. In HYDRA/NERDIO als SYSTEM ausfuehren."
-        }
+    # --- 7) Auf Welcome Screen, Systemkonten und neue Benutzer uebertragen -------
+    try {
+        Copy-UserInternationalSettingsToSystem -WelcomeScreen $true -NewUser $true
+        Write-Host "Welcome Screen/Systemkonten und neue Benutzer: $Language (Copy-UserInternationalSettingsToSystem)."
     }
-    else {
-        # Windows 10: Copy-UserInternationalSettingsToSystem existiert nicht
-        Set-WinUILanguageOverride -Language $Language
-        Set-InternationalSettingsViaIntlCpl -Lang $Language -Geo $GeoId -Kbd $KeyboardId `
-            -Fallback $FallbackUILang -WorkDir $tempFolder.FullName
-        if ($isSystem) { Set-WinUILanguageOverride -Language $SystemUILang }
+    catch {
+        Write-Warning ("Copy-UserInternationalSettingsToSystem fehlgeschlagen: {0} - Fallback intl.cpl." -f $_.Exception.Message)
+        Set-InternationalSettingsViaIntlCpl -Lang $Language -Geo $GeoId -Kbd $KeyboardId -WorkDir $tempFolder.FullName
     }
 
     # --- 8) Sysprep-Vorpruefung -------------------------------------------------
-    # FIX #9: Ein nur fuer EINEN Benutzer installiertes Language Experience Pack
-    # laesst Sysprep mit 0x80073cf2 scheitern ("installed for a user, but not
-    # provisioned for all users") - haeufigster Image-Capture-Abbruch nach LP-Install.
+    # Ein nur benutzerbezogen installiertes Language Experience Pack laesst Sysprep mit 0x80073CF2
+    # scheitern ("installed for a user, but not provisioned for all users").
     try {
-        $lxpUser = Get-AppxPackage -Name "Microsoft.LanguageExperiencePack$Language" -ErrorAction SilentlyContinue
+        $lxpUser = Get-AppxPackage -AllUsers -Name "Microsoft.LanguageExperiencePack$Language" -ErrorAction SilentlyContinue | Select-Object -First 1
         $lxpProv = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
                    Where-Object { $_.DisplayName -like "Microsoft.LanguageExperiencePack$Language*" }
         if ($lxpUser -and -not $lxpProv) {
-            Write-Warning ("LXP '{0}' ist nur benutzerbezogen installiert und NICHT provisioniert -> Sysprep bricht mit 0x80073cf2 ab. Vor dem Capture entfernen: Remove-AppxPackage -Package '{1}'" -f $lxpUser.Name, $lxpUser.PackageFullName)
+            Write-Warning ("LXP '{0}' ist nur benutzerbezogen installiert und NICHT provisioniert -> Sysprep bricht mit 0x80073CF2 ab. Vor einem Image-Capture entfernen: Remove-AppxPackage -AllUsers -Package '{1}'" -f $lxpUser.Name, $lxpUser.PackageFullName)
         }
         else {
             Write-Host ("LXP-Status: user={0} provisioned={1}" -f [bool]$lxpUser, [bool]$lxpProv)
         }
     } catch { Write-Verbose "LXP-Pruefung uebersprungen." }
 
-    # --- 9) Validierung (hart) --------------------------------------------------
+    # --- 9) Validierung ---------------------------------------------------------
     Write-Host '--- Validierung ---'
     Get-InstalledLanguage | Format-Table -AutoSize | Out-String | Write-Host
+    try { Write-Host ("SystemPreferredUI : {0}" -f (Get-SystemPreferredUILanguage)) } catch { Write-Verbose 'Get-SystemPreferredUILanguage nicht verfuegbar.' }
     Write-Host ("Culture           : {0}" -f (Get-Culture).Name)
     Write-Host ("SystemLocale      : {0}" -f (Get-WinSystemLocale).Name)
     Write-Host ("HomeLocation      : {0}" -f (Get-WinHomeLocation).GeoId)
@@ -320,16 +420,24 @@ try {
     Write-Host ("UserLanguageList  : {0}" -f ((Get-WinUserLanguageList).LanguageTag -join ', '))
     Write-Host ("MUI-UILanguages   : {0}" -f ((Get-ChildItem $MuiKey -ErrorAction SilentlyContinue).PSChildName -join ', '))
 
-    if (-not (Test-LanguageReady -Lang $Language)) {
-        throw "Abschlussvalidierung fehlgeschlagen: $Language ist nicht als Anzeigesprache verfuegbar (MUI-Schluessel fehlt)."
+    if (-not (Test-LanguagePackInstalled -Lang $Language)) {
+        throw "Abschlussvalidierung fehlgeschlagen: Sprachpaket $Language ist nicht installiert."
     }
-    Write-Host 'OK. Reboot erforderlich (via HYDRA/NERDIO ausloesen), erst danach Sysprep/Image-Capture.'
+    if (-not (Test-LanguageActive -Lang $Language)) {
+        Write-Host "Hinweis: $Language ist installiert, die MUI-Registrierung erfolgt beim Neustart."
+    }
+    if (-not $sysUiOk) {
+        Write-Warning "System Preferred UI Language konnte nicht gesetzt werden - nach dem Neustart Script erneut ausfuehren."
+    }
+    Write-Host 'OK. Reboot erforderlich (via NERDIO ausloesen), erst danach ist Deutsch aktiv bzw. Sysprep/Image-Capture moeglich.'
 }
 catch {
-    throw $_
+    # Fehler VOR Stop-Transcript ausgeben, damit er im Log steht.
+    Write-Host ("FEHLER: {0} (HResult 0x{1:X8}, Zeile {2})" -f $_.Exception.Message, $_.Exception.HResult, $_.InvocationInfo.ScriptLineNumber)
+    throw
 }
 finally {
-    # --- Rollback Policies + Dienste (laeuft immer) ------------------------------
+    # --- Rollback Policies, Dienste, Tasks (laeuft immer) ------------------------
     try {
         foreach ($r in $RegRestore) {
             if ($null -eq $r.Value) {
@@ -337,6 +445,7 @@ finally {
                 Write-Host ("Policy entfernt (war nicht gesetzt): {0}\{1}" -f $r.Path, $r.Name)
             }
             else {
+                if (-not (Test-Path $r.Path)) { New-Item -Path $r.Path -Force | Out-Null }
                 Set-ItemProperty -Path $r.Path -Name $r.Name -Value ([int]$r.Value) -Type DWord -ErrorAction SilentlyContinue
                 Write-Host ("Policy wiederhergestellt: {0}\{1} = {2}" -f $r.Path, $r.Name, $r.Value)
             }
@@ -347,14 +456,18 @@ finally {
         }
         if ($RegRestore.Count -gt 0) { Restart-Service wuauserv -Force -ErrorAction SilentlyContinue }
     }
-    catch { Write-Warning ("Rollback fehlgeschlagen: {0}" -f $_.Exception.Message) }
+    catch { Write-Warning ("Rollback Policies/Dienste fehlgeschlagen: {0}" -f $_.Exception.Message) }
 
-    # FIX #15: temp-Ordner auch im Fehlerfall raeumen (stand im Original hinter
-    # dem finally und wurde bei throw nie erreicht).
+    foreach ($n in $TaskReenable) {
+        try { Enable-ScheduledTask -TaskPath $LciTaskPath -TaskName $n -ErrorAction Stop | Out-Null; Write-Host ("Task reaktiviert: {0}{1}" -f $LciTaskPath, $n) }
+        catch { Write-Warning ("Task {0}{1} konnte nicht reaktiviert werden: {2}" -f $LciTaskPath, $n, $_.Exception.Message) }
+    }
+
     Remove-Item $tempFolder.FullName -Recurse -Force -ErrorAction SilentlyContinue
 
     if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch { } }
     $VerbosePreference = $savedVerbosePreference
     $ErrorActionPreference = $savedErrorActionPreference
+    $ProgressPreference = $savedProgressPreference
 }
 ##################################################################### END INDIVIDUAL SCRIPT #######################################################################
