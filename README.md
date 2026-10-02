@@ -6,13 +6,15 @@ Windows 11 Enterprise (Single-/Multi-Session) 24H2, 25H2 und 26H2 auf Deutschlan
 
 | Datei | Zweck |
 |---|---|
-| `Install-DE_V8.ps1` | **Das eine Script** (Version 8.0.1): Modes Auto/Install/ReapplyLcu/Validate/PreSysprep sowie CreateRepository (Repository Stufe 2) und ExitCodeTest |
+| `Install-DE_V8_Loader.ps1` | **Das eine Script zum Einfügen in Nerdio/HYDRA** (ca. 84 KB): enthält `Install-DE_V8.ps1` komprimiert, erstellt es beim Lauf lokal, prüft SHA256 und startet es mit denselben Parametern. Kein Internet für das Script nötig |
+| `Install-DE_V8.ps1` | Hauptscript (Version 8.0.1): Modes Auto/Install/ReapplyLcu/Validate/PreSysprep sowie CreateRepository (Repository Stufe 2) und ExitCodeTest |
+| `tools/Build-InstallDE_V8Loader.ps1` | Entwicklerwerkzeug: erzeugt den Loader nach jeder Änderung am Hauptscript neu |
 | `tests/Install-DE_V8.Tests.ps1` | Pester-Tests (Pester 4.10/5.x) nur mit Mocks, keine Systemaufrufe |
 | `PSScriptAnalyzerSettings.psd1` | Analyzer-Regeln inkl. Kompatibilität Windows PowerShell 5.1 |
 | `TESTPLAN.md` | Testplan für Marketplace-VMs 24H2/25H2/26H2 |
 | `CDT-STANDARD-DE-LANGUAGE.ps1` | **Legacy (v3.1)**, durch `Install-DE_V8.ps1` abgelöst; unverändert belassen |
 
-Für den Betrieb wird **nur `Install-DE_V8.ps1`** benötigt; alle übrigen Dateien sind Tests und Dokumentation.
+Für den Betrieb wird **ein Script** benötigt: in Nerdio/HYDRA `Install-DE_V8_Loader.ps1` (empfohlen, siehe Abschnitt 1a), lokal alternativ `Install-DE_V8.ps1` direkt. Alle übrigen Dateien sind Werkzeuge, Tests und Dokumentation.
 
 ---
 
@@ -35,6 +37,22 @@ Für den Betrieb wird **nur `Install-DE_V8.ps1`** benötigt; alle übrigen Datei
 **Pipeline (MS-09: Apps nach den Sprachen):**
 `Install → Reboot → ReapplyLcu → Reboot → Apps installieren → PreSysprep → Sysprep/Capture durch Nerdio/HYDRA`
 Mit `-Mode Auto` genügt nach jedem Neustart derselbe Aufruf, bis `SUCCESS` (Exit 0) gemeldet wird.
+
+## 1a. Offline-Loader (ein Script für Nerdio/HYDRA)
+
+Warum: Das Hauptscript ist 233 KB groß. Beim Kopieren über die Zwischenablage wurde es im Test abgeschnitten (Fehler `The terminator '#>' is missing`). Der Loader ist kleiner, enthält das Hauptscript aber vollständig und braucht keinen Download.
+
+Ablauf beim Lauf:
+1. Prüft Administrator- bzw. SYSTEM-Rechte (sonst Exit 3050, keine Änderungen).
+2. Legt `C:\ProgramData\CDT-LanguageDeployment` an, nur für SYSTEM und Administratoren beschreibbar (vorab von anderen angelegte Ordner werden ersetzt).
+3. Entpackt `Install-DE_V8.ps1` dorthin und prüft SHA256. Bei Abweichung: Exit 3050, nichts wird gestartet.
+4. Startet `Install-DE_V8.ps1` mit allen übergebenen Parametern (gleicher Param-Block inkl. Nerdio `SecureVars`) und gibt dessen Exit-Code zurück.
+
+Einfügen in Nerdio: Datei `Install-DE_V8_Loader.ps1` öffnen, alles markieren, kopieren und einfügen. Danach im Editor prüfen, dass die letzte Zeile `exit $cdtExit` lautet. Ein abgeschnittener Loader ist nicht lauffähig (Parser-Fehler), es wird dann nichts ausgeführt.
+
+**Hinweis Offline-Umgebungen:** Der Loader macht nur den Script-Download überflüssig. Die Installation selbst braucht weiterhin eine Quelle: Stufe 1 (Windows Update) und Stufe 3 (LOF-ISO-Download) benötigen Internet; ohne Internet ist das **Repository (Stufe 2, `-RepositoryPath` auf Azure Files/UNC)** nötig.
+
+Pflege: Nach jeder Änderung an `Install-DE_V8.ps1` den Loader mit `tools/Build-InstallDE_V8Loader.ps1` neu erzeugen. Der Pester-Test „Offline-Loader“ schlägt fehl, solange Loader und Hauptscript nicht übereinstimmen.
 
 ## 2. Modes und Zustandsmodell
 
@@ -293,8 +311,10 @@ Ausschließlich statisch (kein Ausführen der Scripts): Parser, PSScriptAnalyzer
 
 ```powershell
 Invoke-ScriptAnalyzer -Path .\Install-DE_V8.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
+Invoke-ScriptAnalyzer -Path .\Install-DE_V8_Loader.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
+Invoke-ScriptAnalyzer -Path .\tools -Settings .\PSScriptAnalyzerSettings.psd1
 Invoke-ScriptAnalyzer -Path .\tests -Settings .\tests\PSScriptAnalyzerSettings.Tests.psd1
 Invoke-Pester -Script .\tests     # Pester 4.10 oder 5.x
 ```
 
-Ergebnis (2026-10-02): Parser 0 Fehler; PSScriptAnalyzer 0 Funde (`Install-DE_V8.ps1` und Tests); Pester 85/85 bestanden. Alle `.ps1` sind reines ASCII (Windows PowerShell 5.1 liest Dateien ohne BOM als ANSI).
+Ergebnis (2026-10-02): Parser 0 Fehler; PSScriptAnalyzer 0 Funde (`Install-DE_V8.ps1`, `Install-DE_V8_Loader.ps1`, `tools`, Tests); Pester 95/95 bestanden. Alle `.ps1` sind reines ASCII (Windows PowerShell 5.1 liest Dateien ohne BOM als ANSI).

@@ -14,6 +14,9 @@ Legende Ergebnis: ✅ bestanden · ❌ fehlgeschlagen · ⏳ offen
 | 0.2 | Script mit `-RebootIfRequired -ForceReboot` | Exit 3050, keine Änderung (Zustand/Registry unverändert) | ⏳ | ⏳ | ⏳ |
 | 0.3 | Zwei Läufe gleichzeitig starten | Zweiter Lauf: Exit 3050 „anderer Lauf aktiv“ | ⏳ | ⏳ | ⏳ |
 | 0.4 | Nerdio: Parameterblock inkl. `SecureVars` (`NME_PARAMETER`) | Felder erscheinen; `$SecureVars` wird übergeben (Log: `SecureVars=True`) | ⏳ | – | – |
+| 0.5 | `Install-DE_V8_Loader.ps1` als Scripted Action, `Mode=Validate`, VM **ohne** Internet | `Loader: … erstellt (v8.0.1, … SHA256 geprüft)`, danach Validate-Ausgabe, Exit-Code durchgereicht | ⏳ | ⏳ | ⏳ |
+| 0.6 | Loader ohne Adminrechte starten | `Loader: FEHLER Administratorrechte …`, Exit 3050, kein Ordner angelegt | ⏳ | – | – |
+| 0.7 | Ordner `C:\ProgramData\CDT-LanguageDeployment` vorab als Standardbenutzer anlegen, dann Loader als SYSTEM | Ordner ersetzt; danach nur SYSTEM/Administratoren berechtigt (`icacls`) | ⏳ | – | – |
 
 ## 1. Quellen-Kette (jede Stufe einzeln erzwungen)
 
@@ -100,4 +103,4 @@ Legende Ergebnis: ✅ bestanden · ❌ fehlgeschlagen · ⏳ offen
 |---|---|
 | Parser (`[Parser]::ParseFile`) aller Scripts | 0 Fehler |
 | PSScriptAnalyzer 1.23 (inkl. Kompatibilität PS 5.1) | 0 Funde |
-| Pester 4.10 (nur Mocks) | 85/85 bestanden |
+| Pester 4.10 (nur Mocks) | 95/95 bestanden |

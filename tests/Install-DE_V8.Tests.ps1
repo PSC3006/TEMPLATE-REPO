@@ -5,6 +5,7 @@ $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $here
 $env:CDT_LANG_SKIP_MAIN = '1'
 . (Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1')
+. (Join-Path -Path $repoRoot -ChildPath 'tools/Build-InstallDE_V8Loader.ps1')
 $script:ConsoleOutput = $false
 
 # Stubs fuer Windows-only-Befehle, damit Mock sie auf jeder Plattform findet
@@ -74,7 +75,7 @@ function Build-TestFact {
 $script:Cfg = Build-TestConfig
 
 Describe 'Statische Pruefung' {
-    $scripts = @('Install-DE_V8.ps1')
+    $scripts = @('Install-DE_V8.ps1', 'Install-DE_V8_Loader.ps1', 'tools/Build-InstallDE_V8Loader.ps1')
     foreach ($s in $scripts) {
         It "$s hat keine Parser-Fehler" {
             $tokens = $null; $errors = $null
@@ -594,5 +595,63 @@ Describe 'Vorpruefung und OS-Anzeige (8.0.1, Mocks)' {
         Assert-MockCalled -CommandName Get-CDTInstalledLanguagePackBuild -Times 0 -Exactly -Scope It
         Assert-MockCalled -CommandName Write-CDTLog -Times 0 -Exactly -Scope It -ParameterFilter { $Message -like 'Nicht im SYSTEM-Kontext*' }
         Assert-MockCalled -CommandName Write-CDTLog -Times 1 -Exactly -Scope It -ParameterFilter { $Level -eq 'ERROR' -and $Message -like 'Administratorrechte*' }
+    }
+}
+
+Describe 'Offline-Loader (Install-DE_V8_Loader.ps1)' {
+    It 'Enthaelt exakt das aktuelle Install-DE_V8.ps1 (Payload, SHA256, Version)' {
+        $main = Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1'
+        $loaderText = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8_Loader.ps1'))
+        $payload = [regex]::Match($loaderText, "(?s)\`$cdtPayload = @'\n(.*?)\n'@\n").Groups[1].Value
+        $payload | Should -Not -BeNullOrEmpty
+        $decoded = ConvertFrom-CDTGzipBase64 -Payload $payload
+        $expected = [System.IO.File]::ReadAllBytes($main)
+        $decoded.Length | Should -Be $expected.Length
+        [System.Convert]::ToBase64String($decoded) -eq [System.Convert]::ToBase64String($expected) | Should -BeTrue
+        $sha = (Get-FileHash -LiteralPath $main -Algorithm SHA256).Hash
+        [regex]::Match($loaderText, "\`$cdtSha256 = '([0-9A-F]{64})'").Groups[1].Value | Should -Be $sha
+        [regex]::Match($loaderText, "\`$cdtVersion = '([0-9.]+)'").Groups[1].Value | Should -Be $script:ScriptVersion
+    }
+    It 'Param-Block identisch zu Install-DE_V8.ps1 (Nerdio-Felder, SecureVars)' {
+        $mainParam = Get-CDTParamBlockText -Path (Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1')
+        $loaderParam = Get-CDTParamBlockText -Path (Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8_Loader.ps1')
+        $loaderParam.Text | Should -Be $mainParam.Text
+        ($loaderParam.Names -join ',') | Should -Be ($mainParam.Names -join ',')
+        $loaderParam.Names | Should -Contain 'SecureVars'
+    }
+    It 'Loader entspricht der Vorlage des Build-Werkzeugs (kein Handeingriff)' {
+        $loaderPath = Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8_Loader.ps1'
+        $loaderText = [System.IO.File]::ReadAllText($loaderPath)
+        $payload = [regex]::Match($loaderText, "(?s)\`$cdtPayload = @'\n(.*?)\n'@\n").Groups[1].Value
+        $param = Get-CDTParamBlockText -Path (Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1')
+        $sha = (Get-FileHash -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1') -Algorithm SHA256).Hash
+        $rebuilt = ConvertTo-CDTLoaderScript -ParamBlock $param.Text -ParamName $param.Names -Payload $payload -Sha256 $sha -Version $script:ScriptVersion
+        ($rebuilt -eq $loaderText) | Should -BeTrue
+    }
+    It 'Build-Werkzeug: GZip/Base64-Roundtrip und Zeilenlaenge 120' {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes(('Zeile {0}' -f 1) * 5000)
+        $b64 = ConvertTo-CDTGzipBase64 -Bytes $bytes
+        @($b64 -split "`n" | Where-Object { $_.Length -gt 120 }).Count | Should -Be 0
+        $back = ConvertFrom-CDTGzipBase64 -Payload $b64
+        [System.Text.Encoding]::ASCII.GetString($back) | Should -Be ([System.Text.Encoding]::ASCII.GetString($bytes))
+    }
+    It 'Build-Werkzeug erzeugt einen parsebaren Loader (TestDrive, nur Dateien)' {
+        $tmp = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath ('cdt-loader-' + [guid]::NewGuid() + '.ps1')
+        try {
+            $r = New-CDTEmbeddedLoader -SourcePath (Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1') -OutputPath $tmp
+            $r.Version | Should -Be $script:ScriptVersion
+            $tokens = $null; $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$tokens, [ref]$errors)
+            @($errors).Count | Should -Be 0
+            $payload = [regex]::Match([System.IO.File]::ReadAllText($tmp), "(?s)\`$cdtPayload = @'\n(.*?)\n'@\n").Groups[1].Value
+            (ConvertFrom-CDTGzipBase64 -Payload $payload).Length | Should -Be ([System.IO.File]::ReadAllBytes((Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8.ps1')).Length)
+        }
+        finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }
+    }
+    It 'Gekuerzter Loader ist nicht parsebar (nichts wird ausgefuehrt)' {
+        $loaderText = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'Install-DE_V8_Loader.ps1'))
+        $tokens = $null; $errors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($loaderText.Substring(0, [int]($loaderText.Length / 2)), [ref]$tokens, [ref]$errors)
+        @($errors).Count | Should -BeGreaterThan 0
     }
 }
