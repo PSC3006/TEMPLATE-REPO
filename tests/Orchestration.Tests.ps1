@@ -54,7 +54,7 @@ Describe 'Ablaufsimulation' {
         Mock Get-CdtPlatformInfo {
             $rel = Resolve-CdtRelease -Build $Sim.Build -DisplayVersion $null -ReleaseMap $CdtReleaseMap
             [ordered]@{ Caption = 'Microsoft Windows 11 Enterprise multi-session'; EditionId = 'ServerRdsh'; Sku = 175; DisplayVersion = $rel.Release; Build = $Sim.Build; Ubr = 6584; Architecture = 'AMD64'
-                ProductType = 1; InstallationType = 'Client'; IsClient = $true; IsWindows11 = $true; ReleaseInfo = $rel; EditionClass = (Get-CdtEditionClass -EditionId 'ServerRdsh' -Sku 175 -ProductType 1 -InstallationType 'Client')
+                ProductType = 3; InstallationType = 'Client'; IsClient = $true; IsWindows11 = $true; ReleaseInfo = $rel; EditionClass = (Get-CdtEditionClass -EditionId 'ServerRdsh' -Sku 175 -ProductType 3 -InstallationType 'Client')
                 LastBootUtc = $Sim.Boot; SmbiosUuid = 'UUID-SIM'; InstallDateUtc = 'x'; InstallLanguageLcid = '0409'; InstallLanguageTag = 'en-US'; Errors = @() }
         }
         Mock Get-CdtExecutionContext { [ordered]@{ Identity = 'NT AUTHORITY\SYSTEM'; Sid = 'S-1-5-18'; IsSystem = $true; IsAdmin = $true; SourceHiveName = '.DEFAULT'; OrchestratorHint = 'Test'; PSVersion = '5.1'; PSEdition = 'Desktop'; Is64BitProcess = $true; LanguageMode = 'FullLanguage' } }

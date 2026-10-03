@@ -99,14 +99,57 @@ Describe 'Release- und Editionszuordnung' {
         (Resolve-CdtRelease -Build 26200 -DisplayVersion '24H2' -ReleaseMap $CdtReleaseMap).DisplayVersionMismatch | Should -BeTrue
     }
     It 'unterscheidet AVD-Ziel, technisch moeglich, sprachbeschraenkt und Server' {
-        $m = Get-CdtEditionClass -EditionId 'ServerRdsh' -Sku 175 -ProductType 1 -InstallationType 'Client'
-        $m.Class | Should -Be 'EnterpriseMultiSession'; $m.AvdTarget | Should -BeTrue
+        # Enterprise multi-session meldet real ProductType 3 (wie Server)
+        $m = Get-CdtEditionClass -EditionId 'ServerRdsh' -Sku 175 -ProductType 3 -InstallationType 'Client'
+        $m.Class | Should -Be 'EnterpriseMultiSession'; $m.AvdTarget | Should -BeTrue; $m.Supported | Should -BeTrue
+        (Get-CdtEditionClass -EditionId 'ServerRdsh' -Sku 175 -ProductType 3 -InstallationType 'Server').Class | Should -Be 'EnterpriseMultiSession'
         (Get-CdtEditionClass -EditionId 'Enterprise' -Sku 4 -ProductType 1 -InstallationType 'Client').AvdTarget | Should -BeTrue
         $p = Get-CdtEditionClass -EditionId 'Professional' -Sku 48 -ProductType 1 -InstallationType 'Client'
         $p.Supported | Should -BeTrue; $p.AvdTarget | Should -BeFalse
         $sl = Get-CdtEditionClass -EditionId 'CoreSingleLanguage' -Sku 100 -ProductType 1 -InstallationType 'Client'
         $sl.LanguageRestricted | Should -BeTrue; $sl.Supported | Should -BeFalse
-        (Get-CdtEditionClass -EditionId 'ServerDatacenter' -Sku 8 -ProductType 3 -InstallationType 'Server').Class | Should -Be 'Server'
+        (Get-CdtEditionClass -EditionId 'ServerDatacenter' -Sku 8 -ProductType 3 -InstallationType 'Server').Class | Should -Be 'Server'    }
+}
+
+Describe 'Plattformerkennung Enterprise multi-session (Regression NERDIO-Test-VM: UNSUPPORTED/Exit 5)' {
+    BeforeAll {
+        # CimCmdlets fehlen unter PowerShell 7/Linux: Platzhalter, damit Pester mocken kann
+        if ($null -eq (Get-Command -Name 'Get-CimInstance' -ErrorAction SilentlyContinue)) {
+            function global:Get-CimInstance { [CmdletBinding()] param([string]$ClassName) }
+        }
+    }
+    It 'stuft Windows 11 Enterprise multi-session (ServerRdsh, SKU 175, ProductType 3) als Client und AVD-Ziel ein' {
+        Mock Get-CdtRegistryValues { [ordered]@{ Values = @{ ProductName = 'Windows 10 Enterprise multi-session'; EditionID = 'ServerRdsh'; DisplayVersion = '25H2'; CurrentBuild = '26200'; UBR = 9457; InstallationType = 'Client' } } }
+        Mock Get-CdtRegistryValueOrNull { '0409' }
+        Mock Get-CimInstance -ParameterFilter { $ClassName -eq 'Win32_OperatingSystem' } {
+            [pscustomobject]@{ Caption = 'Microsoft Windows 11 Enterprise multi-session'; Version = '10.0.26200'; OperatingSystemSKU = 175; ProductType = 3; LastBootUpTime = [datetime]'2026-10-03T13:47:49'; BuildNumber = '26200' }
+        }
+        Mock Get-CimInstance -ParameterFilter { $ClassName -eq 'Win32_ComputerSystemProduct' } { [pscustomobject]@{ UUID = 'UUID-TEST-1' } }
+        $p = Get-CdtPlatformInfo
+        $p.ProductType | Should -Be 3
+        $p.EditionClass.Class | Should -Be 'EnterpriseMultiSession'
+        $p.IsClient | Should -BeTrue
+        $p.IsWindows11 | Should -BeTrue
+        $p.ReleaseInfo.Release | Should -Be '25H2'
+
+        New-TestCdtContext -Root (Join-Path $TestDrive 'prereq')
+        $Cdt.Platform = $p
+        $Cdt.Context = [ordered]@{ LanguageMode = 'FullLanguage'; IsSystem = $true; IsAdmin = $true }
+        $r = Test-CdtPrerequisites
+        # Unter Linux fehlen die Windows-Cmdlets (eigene Befunde); Plattform/Edition darf nicht mehr blockieren
+        @($r.Fatal | Where-Object { $_ -notmatch '^Cmdlet ' }) | Should -BeNullOrEmpty
+        @($r.Warnings | Where-Object { $_ -notmatch '^Cmdlet ' }) | Should -BeNullOrEmpty
+    }
+    It 'weist Windows Server weiterhin ab' {
+        Mock Get-CdtRegistryValues { [ordered]@{ Values = @{ ProductName = 'Windows Server 2025 Datacenter'; EditionID = 'ServerDatacenter'; DisplayVersion = '24H2'; CurrentBuild = '26100'; UBR = 1; InstallationType = 'Server' } } }
+        Mock Get-CdtRegistryValueOrNull { '0409' }
+        Mock Get-CimInstance -ParameterFilter { $ClassName -eq 'Win32_OperatingSystem' } {
+            [pscustomobject]@{ Caption = 'Microsoft Windows Server 2025 Datacenter'; Version = '10.0.26100'; OperatingSystemSKU = 8; ProductType = 3; LastBootUpTime = [datetime]'2026-10-03T13:47:49'; BuildNumber = '26100' }
+        }
+        Mock Get-CimInstance -ParameterFilter { $ClassName -eq 'Win32_ComputerSystemProduct' } { [pscustomobject]@{ UUID = 'UUID-TEST-1' } }
+        $p = Get-CdtPlatformInfo
+        $p.IsClient | Should -BeFalse
+        $p.EditionClass.Class | Should -Be 'Server'
     }
 }
 

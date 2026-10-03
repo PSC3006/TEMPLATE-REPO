@@ -43,7 +43,7 @@
 # =====================================================================================================
 # KONFIGURATION (Standardwerte - fuer den Normalbetrieb ist keine Aenderung noetig)
 # =====================================================================================================
-$CdtScriptVersion    = '4.0.0'
+$CdtScriptVersion    = '4.0.1'
 $CdtLogSchemaVersion = '1.0'
 $CdtProductName      = 'CDT-STANDARD-INSTALL-DE_LANG'
 
@@ -1164,6 +1164,12 @@ function Get-CdtEditionClass {
     # Unterscheidet technische Eignung von der AVD-Zielplattform (keine Umgehung von Editionsgrenzen)
     param([AllowNull()][string]$EditionId, [int]$Sku, [int]$ProductType, [AllowNull()][string]$InstallationType)
     $c = [ordered]@{ Class = 'Unknown'; Supported = $false; AvdTarget = $false; LanguageRestricted = $false; Note = '' }
+    # Enterprise multi-session meldet ProductType 3 wie Windows Server (Microsoft Multi-Session-FAQ), ist aber ein Client-OS:
+    # daher vor der Server-Pruefung ueber SKU 175 / EditionID ServerRdsh einordnen
+    if ($Sku -eq 175 -or @('ServerRdsh', 'EnterpriseMultiSession') -contains $EditionId) {
+        $c.Class = 'EnterpriseMultiSession'; $c.Supported = $true; $c.AvdTarget = $true; $c.Note = ('Windows Enterprise multi-session (SKU 175, ProductType {0}).' -f $ProductType)
+        return $c
+    }
     if ($ProductType -ne 1 -or $InstallationType -eq 'Server') {
         $c.Class = 'Server'; $c.Note = 'Server-Betriebssystem: LanguagePackManagement ist nur fuer Client-Betriebssysteme unterstuetzt.'
         return $c
@@ -1171,10 +1177,6 @@ function Get-CdtEditionClass {
     if (@('CoreSingleLanguage', 'CoreCountrySpecific') -contains $EditionId -or @(99, 100) -contains $Sku) {
         $c.Class = 'LanguageRestricted'; $c.LanguageRestricted = $true
         $c.Note = 'Sprachbeschraenkte Edition (Single Language/Country Specific): Anzeigesprache lizenzrechtlich festgelegt; keine Umgehung.'
-        return $c
-    }
-    if ($Sku -eq 175 -or @('ServerRdsh', 'EnterpriseMultiSession') -contains $EditionId) {
-        $c.Class = 'EnterpriseMultiSession'; $c.Supported = $true; $c.AvdTarget = $true; $c.Note = 'Windows Enterprise multi-session (SKU 175).'
         return $c
     }
     if (@('Enterprise', 'EnterpriseN') -contains $EditionId) {
@@ -1224,10 +1226,11 @@ function Get-CdtPlatformInfo {
     $arch = $env:PROCESSOR_ARCHITEW6432
     if ([string]::IsNullOrEmpty($arch)) { $arch = $env:PROCESSOR_ARCHITECTURE }
     $p.Architecture = [string]$arch
-    $p.IsClient = ($p.ProductType -eq 1 -and $p.InstallationType -ne 'Server')
+    $p.EditionClass = Get-CdtEditionClass -EditionId $p.EditionId -Sku $p.Sku -ProductType $p.ProductType -InstallationType $p.InstallationType
+    # ProductType 3 bei Enterprise multi-session ist beabsichtigt (RDSH-Kompatibilitaet) und kein Server-Merkmal
+    $p.IsClient = (($p.ProductType -eq 1 -and $p.InstallationType -ne 'Server') -or $p.EditionClass.Class -eq 'EnterpriseMultiSession')
     $p.IsWindows11 = ($p.IsClient -and $p.Build -ge 22000)
     $p.ReleaseInfo = Resolve-CdtRelease -Build $p.Build -DisplayVersion $p.DisplayVersion -ReleaseMap $CdtReleaseMap
-    $p.EditionClass = Get-CdtEditionClass -EditionId $p.EditionId -Sku $p.Sku -ProductType $p.ProductType -InstallationType $p.InstallationType
     $p.InstallLanguageLcid = [string](Get-CdtRegistryValueOrNull -Hive LocalMachine -SubKey 'SYSTEM\CurrentControlSet\Control\Nls\Language' -Name 'InstallLanguage')
     $p.InstallLanguageTag = Get-CdtCultureTag -LcidHex $p.InstallLanguageLcid
     $p.Errors = @($errs)
