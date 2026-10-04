@@ -230,29 +230,76 @@ Describe 'Fehlerklassifikation' {
 
 Describe 'Logging, Zustand und Zusammenfassung' {
     BeforeEach { New-TestCdtContext -Root (Join-Path $TestDrive ('log-' + [guid]::NewGuid().ToString('N').Substring(0, 6))) }
-    It 'schreibt JSONL (ASCII, ein Objekt pro Zeile, Pflichtfelder) und Textlog mit BOM' {
+    It 'schreibt das Full-Log als Text (BOM) und als gueltiges JSON-Array (ASCII, Pflichtfelder)' {
         Write-CdtLog -Phase 'Test' -Action 'One' -Message ('Umlaut ' + [char]0x00E4) -ErrorCode '0x800F0954' -Source 'WindowsUpdate' -Attempt 1 -DurationMs 12 -PreviousState 'NotPresent' -TargetState 'Installed' -ResultState 'InstallPending' -Recommendation 'x'
         Write-CdtLog -Level WARN -Phase 'Test' -Action 'Two' -Message 'password=abc'
-        $lines = @([System.IO.File]::ReadAllLines($Cdt.Log.Jsonl) | Where-Object { $_ })
-        $lines.Count | Should -Be 2
-        foreach ($l in $lines) {
-            $o = $l | ConvertFrom-Json
+        $raw = [System.IO.File]::ReadAllText($Cdt.Log.Json)
+        $raw.TrimStart().StartsWith('[') | Should -BeTrue
+        $items = @($raw | ConvertFrom-Json)
+        $items.Count | Should -Be 2
+        foreach ($o in $items) {
             $o.runId | Should -Be $Cdt.RunId
             $o.scriptVersion | Should -Be $CdtScriptVersion
             $o.schemaVersion | Should -Be $CdtLogSchemaVersion
-            $l | Should -Match '"ts":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}"'
-            $l | Should -Match '"tsUtc":"[^"]+Z"'
             $o.vm | Should -Be 'TESTVM'
             $o.phase | Should -Be 'Test'
         }
-        ($lines[0] | ConvertFrom-Json).errorCode | Should -Be '0x800F0954'
-        ($lines[0] | ConvertFrom-Json).resultState | Should -Be 'InstallPending'
-        ([System.IO.File]::ReadAllBytes($Cdt.Log.Jsonl) | Where-Object { $_ -gt 127 }) | Should -BeNullOrEmpty
-        $raw = [System.IO.File]::ReadAllText($Cdt.Log.Jsonl)
+        $raw | Should -Match '"ts":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{2}:\d{2}"'
+        $raw | Should -Match '"tsUtc":"[^"]+Z"'
+        $items[0].errorCode | Should -Be '0x800F0954'
+        $items[0].resultState | Should -Be 'InstallPending'
+        $items[0].message | Should -Be ('Umlaut ' + [char]0x00E4)
+        ([System.IO.File]::ReadAllBytes($Cdt.Log.Json) | Where-Object { $_ -gt 127 }) | Should -BeNullOrEmpty
         $raw | Should -Not -Match 'password=abc'
         $tb = [System.IO.File]::ReadAllBytes($Cdt.Log.Text)
         ($tb[0], $tb[1], $tb[2]) | Should -Be @(0xEF, 0xBB, 0xBF)
         (Split-Path -Leaf $Cdt.Log.Text) | Should -Match ('^TESTVM_INSTALL-DE_\d{4}-\d{2}-\d{2}\.log$')
+        (Split-Path -Leaf $Cdt.Log.Json) | Should -Match ('^TESTVM_INSTALL-DE_\d{4}-\d{2}-\d{2}\.json$')
+    }
+    It 'legt das Error-Log nur bei Fehlern an und uebernimmt ausschliesslich ERROR-Eintraege unveraendert' {
+        Write-CdtLog -Phase 'Test' -Action 'Info' -Message 'alles gut'
+        Write-CdtLog -Level WARN -Phase 'Test' -Action 'Warn' -Message 'nur Warnung'
+        Test-Path -LiteralPath $Cdt.Log.ErrorText | Should -BeFalse
+        Test-Path -LiteralPath $Cdt.Log.ErrorJson | Should -BeFalse
+        Write-CdtLog -Level ERROR -Phase 'Test' -Action 'E1' -Message 'erster Fehler' -ErrorCode '0x800F081F'
+        Write-CdtLog -Level 'CHECK' -Phase 'Test' -Action 'Chk' -Message 'Pruefung'
+        Write-CdtLog -Level ERROR -Phase 'Test' -Action 'E2' -Message 'zweiter Fehler'
+        $errLines = @([System.IO.File]::ReadAllLines($Cdt.Log.ErrorText) | Where-Object { $_ })
+        $errLines.Count | Should -Be 2
+        foreach ($l in $errLines) { $l | Should -Match '\[ERROR\]' }
+        $fullErr = @([System.IO.File]::ReadAllLines($Cdt.Log.Text) | Where-Object { $_ -match '\[ERROR\]' })
+        $errLines | Should -Be $fullErr
+        $errItems = @([System.IO.File]::ReadAllText($Cdt.Log.ErrorJson) | ConvertFrom-Json)
+        $errItems.Count | Should -Be 2
+        @($errItems | ForEach-Object { $_.level } | Select-Object -Unique) | Should -Be @('ERROR')
+        $errItems[0].errorCode | Should -Be '0x800F081F'
+        @([System.IO.File]::ReadAllText($Cdt.Log.Json) | ConvertFrom-Json).Count | Should -Be 5
+        $Cdt.Log.RunErrorCount | Should -Be 2
+        (Split-Path -Leaf $Cdt.Log.ErrorText) | Should -Match ('^TESTVM_INSTALL-DE_\d{4}-\d{2}-\d{2}\.error\.log$')
+        (Split-Path -Leaf $Cdt.Log.ErrorJson) | Should -Match ('^TESTVM_INSTALL-DE_\d{4}-\d{2}-\d{2}\.error\.json$')
+    }
+    It 'haengt Folgelaeufe desselben Tages an (JSON bleibt gueltig) und uebernimmt Fehler aus der Fruehphase' {
+        $root = $Cdt.Log.Root
+        Write-CdtLog -Phase 'Test' -Action 'Run1' -Message 'Lauf 1'
+        $first = $Cdt.RunId
+        New-TestCdtContext -Root $root
+        Write-CdtLog -Level ERROR -Phase 'Test' -Action 'Run2' -Message 'Lauf 2 Fehler'
+        $items = @([System.IO.File]::ReadAllText($Cdt.Log.Json) | ConvertFrom-Json)
+        @($items | ForEach-Object { $_.runId } | Select-Object -Unique) | Should -Be @($first, $Cdt.RunId)
+        # Eintraege vor der Log-Initialisierung (Fruehphase) landen nach der Initialisierung ebenfalls im Error-Log
+        $Cdt.Log.Ready = $false
+        Write-CdtLog -Level ERROR -Phase 'Init' -Action 'Early' -Message 'frueher Fehler'
+        [void](Initialize-CdtLogging)
+        @([System.IO.File]::ReadAllText($Cdt.Log.ErrorJson) | ConvertFrom-Json | ForEach-Object { $_.action }) | Should -Be @('Run2', 'Early')
+    }
+    It 'sichert ein unvollstaendiges JSON-Log und beginnt ein neues gueltiges Array' {
+        $root = $Cdt.Log.Root
+        Write-CdtLog -Phase 'Test' -Action 'A' -Message 'vorher'
+        [System.IO.File]::AppendAllText($Cdt.Log.Json, ',{"abgebrochen":')
+        New-TestCdtContext -Root $root
+        @(Get-ChildItem -LiteralPath $root -Filter '*.json.corrupt-*').Count | Should -Be 1
+        $items = @([System.IO.File]::ReadAllText($Cdt.Log.Json) | ConvertFrom-Json)
+        @($items | Where-Object { $_.level -eq 'WARN' -and $_.action -eq 'Logging' }).Count | Should -Be 1
     }
     It 'haengt mehrere Laeufe eines Tages an die Zusammenfassung an (latest = neuester)' {
         $Cdt.Status = 'REBOOT_REQUIRED'; $Cdt.ExitCode = 0; $Cdt.CaptureAllowed = $false
@@ -320,18 +367,40 @@ Describe 'missing-network-requirements (TXT/CSV)' {
         $txt = [System.IO.File]::ReadAllText($Cdt.Log.MissingTxt)
         $txt | Should -Match 'FEHLGESCHLAGENE ERFORDERLICHE VERBINDUNGEN: 2'
         $txt | Should -Match 'emdl.ws.microsoft.com'
+        $Cdt.Log.MissingWritten | Should -BeTrue
     }
-    It 'zeigt nach erfolgreicher Pruefung eindeutig keine fehlenden Verbindungen' {
+    It 'schreibt keine Datei, wenn keine Netzwerkvoraussetzung fehlt, und entfernt veraltete eigene Dateien' {
+        $fail = [ordered]@{ Id = 'B'; Host = 'fe3.delivery.mp.microsoft.com'; Port = 443; Protocol = 'HTTPS'; Url = 'https://fe3.delivery.mp.microsoft.com/'; Required = $true; Requirement = '*.delivery.mp.microsoft.com'; Purpose = 'WU'; Reference = 'MS'; ProxyMode = 'Direct'; Proxy = 'direkt'; ProxySource = 'x'; ConnectTarget = 'fe3.delivery.mp.microsoft.com:443'; Dns = $null; Status = 'Fail'; Category = 'TcpConnectFailure'; Code = 'TimedOut'; Detail = 'd'; Recommendation = 'r'; TimestampUtc = 't' }
+        [void]$Cdt.Network.Results.Add($fail)
+        Write-CdtNetworkRequirementFiles
+        Test-Path -LiteralPath $Cdt.Log.MissingCsv | Should -BeTrue
+        # Folgelauf: erneute Pruefung erfolgreich (nur optionaler Fehler) -> keine Datei mehr
+        $Cdt.Network.Results.Clear()
+        $pass = [ordered]@{ Id = 'A'; Host = 'ok'; Port = 443; Protocol = 'HTTPS'; Url = 'u'; Required = $true; Requirement = 'ok'; Purpose = 'p'; Reference = 'r'; ProxyMode = 'Direct'; Proxy = 'direkt'; ProxySource = 'x'; ConnectTarget = 'ok:443'; Dns = $null; Status = 'Pass'; Category = ''; Code = ''; Detail = ''; Recommendation = ''; TimestampUtc = 't' }
+        $opt = [ordered]@{ Id = 'D'; Host = 'emdl.ws.microsoft.com'; Port = 80; Protocol = 'HTTP'; Url = 'http://emdl.ws.microsoft.com/'; Required = $false; Requirement = 'emdl.ws.microsoft.com'; Purpose = 'diag'; Reference = 'MS'; ProxyMode = 'Direct'; Proxy = 'direkt'; ProxySource = 'x'; ConnectTarget = 'emdl.ws.microsoft.com:80'; Dns = $null; Status = 'Fail'; Category = 'TcpConnectFailure'; Code = 'TimedOut'; Detail = 'd'; Recommendation = 'x'; TimestampUtc = 't' }
+        foreach ($x in @($pass, $opt)) { [void]$Cdt.Network.Results.Add($x) }
+        Write-CdtNetworkRequirementFiles
+        Test-Path -LiteralPath $Cdt.Log.MissingCsv | Should -BeFalse
+        Test-Path -LiteralPath $Cdt.Log.MissingTxt | Should -BeFalse
+        $Cdt.Log.MissingWritten | Should -BeFalse
+        [System.IO.File]::ReadAllText($Cdt.Log.Text) | Should -Match 'keine fehlenden Netzwerkvoraussetzungen.*Veraltete Datei'
+        $Cdt.State.network.lastCheck.runId | Should -Be $Cdt.RunId
+    }
+    It 'laesst vorhandene Dateien unveraendert, wenn in diesem Lauf keine Netzwerkpruefung stattfand' {
+        [void]$Cdt.Network.Results.Add([ordered]@{ Id = 'B'; Host = 'h'; Port = 443; Protocol = 'HTTPS'; Url = 'u'; Required = $true; Requirement = 'h'; Purpose = 'WU'; Reference = 'MS'; ProxyMode = 'Direct'; Proxy = 'direkt'; ProxySource = 'x'; ConnectTarget = 'h:443'; Dns = $null; Status = 'Fail'; Category = 'TcpConnectFailure'; Code = 'TimedOut'; Detail = 'd'; Recommendation = 'r'; TimestampUtc = 't' })
+        Write-CdtNetworkRequirementFiles
+        $before = [System.IO.File]::ReadAllText($Cdt.Log.MissingCsv)
+        $Cdt.Network.Results.Clear()
+        Write-CdtNetworkRequirementFiles
+        [System.IO.File]::ReadAllText($Cdt.Log.MissingCsv) | Should -Be $before
+        $Cdt.Log.MissingWritten | Should -BeFalse
+    }
+    It 'entfernt keine fremde Datei gleichen Namens' {
+        [System.IO.File]::WriteAllText($Cdt.Log.MissingTxt, 'fremder Inhalt')
         [void]$Cdt.Network.Results.Add([ordered]@{ Id = 'A'; Host = 'ok'; Port = 443; Protocol = 'HTTPS'; Url = 'u'; Required = $true; Requirement = 'ok'; Purpose = 'p'; Reference = 'r'; ProxyMode = 'Direct'; Proxy = 'direkt'; ProxySource = 'x'; ConnectTarget = 'ok:443'; Dns = $null; Status = 'Pass'; Category = ''; Code = ''; Detail = ''; Recommendation = ''; TimestampUtc = 't' })
         Write-CdtNetworkRequirementFiles
-        $rows = @(Import-Csv -LiteralPath $Cdt.Log.MissingCsv -Delimiter ';' -Encoding UTF8)
-        $rows.Count | Should -Be 1
-        $rows[0].Pruefstatus | Should -Be 'KEINE_FEHLGESCHLAGENEN_ERFORDERLICHEN_VERBINDUNGEN'
-        [System.IO.File]::ReadAllText($Cdt.Log.MissingTxt) | Should -Match 'KEINE fehlgeschlagenen erforderlichen'
-    }
-    It 'kennzeichnet Laeufe ohne Netzwerkpruefung als NICHT_GEPRUEFT' {
-        Write-CdtNetworkRequirementFiles
-        (@(Import-Csv -LiteralPath $Cdt.Log.MissingCsv -Delimiter ';' -Encoding UTF8))[0].Pruefstatus | Should -Be 'NICHT_GEPRUEFT'
+        [System.IO.File]::ReadAllText($Cdt.Log.MissingTxt) | Should -Be 'fremder Inhalt'
+        [System.IO.File]::ReadAllText($Cdt.Log.Text) | Should -Match 'Fremde Datei gleichen Namens nicht veraendert'
     }
 }
 

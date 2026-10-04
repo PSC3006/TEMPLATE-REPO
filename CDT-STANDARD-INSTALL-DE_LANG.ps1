@@ -36,14 +36,18 @@
       4 LOCKED            5 UNSUPPORTED/PREREQUISITE
       6 LOGGING_UNAVAILABLE                     9 INTERNAL_ERROR
     Letzte Konsolenzeile: CDT_RESULT {json} (maschinenlesbar)
-    Logs: C:\install\CDT-STANDARD-INSTALL-DE_LANG
+    Logs: C:\install\CDT-STANDARD-INSTALL-DE_LANG (<VmName>_INSTALL-DE_<YYYY-MM-DD>.*)
+      .log + .json               Full-Log (vollstaendiger Lauf; .json = gueltiges JSON-Array)
+      .error.log + .error.json   Error-Log (nur ERROR-Eintraege; existiert nur, wenn Fehler auftraten)
+      .summary.json              Tageszusammenfassung (alle Laeufe, neuester Status)
+      missing-network-requirements.txt/.csv  nur bei fehlenden Netzwerkvoraussetzungen
     Datei ist bewusst reines ASCII (Windows PowerShell 5.1 liest BOM-lose Scripte als ANSI).
 #>
 
 # =====================================================================================================
 # KONFIGURATION (Standardwerte - fuer den Normalbetrieb ist keine Aenderung noetig)
 # =====================================================================================================
-$CdtScriptVersion    = '4.0.1'
+$CdtScriptVersion    = '4.1.0'
 $CdtLogSchemaVersion = '1.0'
 $CdtProductName      = 'CDT-STANDARD-INSTALL-DE_LANG'
 
@@ -870,8 +874,108 @@ function Register-CdtKnownSecret {
 }
 
 # =====================================================================================================
-# LOGGING (Text-Log UTF-8 mit BOM, JSONL/JSON reines ASCII)
+# LOGGING
+#   Full-Log : <VmName>_INSTALL-DE_<Datum>.log (Text, UTF-8 mit BOM) + .json (JSON-Array, reines ASCII)
+#   Error-Log: <VmName>_INSTALL-DE_<Datum>.error.log + .error.json - nur ERROR-Eintraege des Full-Logs,
+#              Dateien entstehen erst beim ersten Fehler
 # =====================================================================================================
+function Get-CdtFileTail {
+    # Letzte Nicht-Leerraum-Bytes einer Datei (fuer die Pflege des JSON-Arrays ohne Komplett-Lesen)
+    param([System.IO.FileStream]$Stream)
+    $len = $Stream.Length
+    $n = [int][Math]::Min([int64]256, $len)
+    [void]$Stream.Seek(-$n, [System.IO.SeekOrigin]::End)
+    $buf = New-Object byte[] $n
+    $read = 0
+    while ($read -lt $n) {
+        $r = $Stream.Read($buf, $read, $n - $read)
+        if ($r -le 0) { break }
+        $read += $r
+    }
+    $ws = @(9, 10, 13, 32)
+    $k = $read - 1
+    while ($k -ge 0 -and $ws -contains [int]$buf[$k]) { $k-- }
+    $j = $k - 1
+    while ($j -ge 0 -and $ws -contains [int]$buf[$j]) { $j-- }
+    # Last = letztes Zeichen (erwartet ']'), Prev = Zeichen davor ('[' leeres Array, '}' letzter Eintrag)
+    return [ordered]@{
+        Last    = $(if ($k -ge 0) { [int]$buf[$k] } else { -1 })
+        Prev    = $(if ($j -ge 0) { [int]$buf[$j] } else { -1 })
+        PrevEnd = $(if ($j -ge 0) { $len - $read + $j + 1 } else { -1 })
+    }
+}
+
+function Test-CdtJsonArrayFile {
+    # $true, wenn die Datei ein vom Script gepflegtes, vollstaendiges JSON-Array ist ('[' ... ']')
+    param([string]$Path)
+    $fs = $null
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 2) { return $false }
+        $first = -1
+        while ($fs.Position -lt [Math]::Min([int64]64, $fs.Length)) {
+            $b = $fs.ReadByte()
+            if (@(9, 10, 13, 32, 0xEF, 0xBB, 0xBF) -notcontains $b) { $first = $b; break }
+        }
+        $t = Get-CdtFileTail -Stream $fs
+        return ($first -eq 91 -and $t.Last -eq 93 -and @(91, 125) -contains $t.Prev)
+    }
+    catch { return $false }
+    finally { if ($null -ne $fs) { $fs.Dispose() } }
+}
+
+function Add-CdtJsonArrayItem {
+    # Haengt ein Objekt an das JSON-Array an; die Datei ist nach jedem Eintrag gueltiges JSON (reines ASCII, ohne BOM)
+    param([string]$Path, [string]$Json)
+    $nl = "`r`n"
+    for ($i = 1; $i -le 6; $i++) {
+        $fs = $null
+        try {
+            $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+            $pos = [int64]0
+            $text = '[' + $nl + $Json + $nl + ']' + $nl
+            if ($fs.Length -gt 0) {
+                $t = Get-CdtFileTail -Stream $fs
+                if ($t.Last -ne 93 -or @(91, 125) -notcontains $t.Prev) { throw (New-Object System.IO.InvalidDataException(('JSON-Log ist kein vollstaendiges Array: {0}' -f $Path))) }
+                $pos = $t.PrevEnd
+                if ($t.Prev -eq 91) { $text = $nl + $Json + $nl + ']' + $nl } else { $text = ',' + $nl + $Json + $nl + ']' + $nl }
+            }
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($text)
+            [void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)
+            $fs.Write($bytes, 0, $bytes.Length)
+            $fs.SetLength($fs.Position)
+            $fs.Flush()
+            return
+        }
+        catch [System.IO.InvalidDataException] { throw }
+        catch {
+            if ($i -eq 6) { throw }
+            Start-Sleep -Milliseconds (150 * $i)
+        }
+        finally { if ($null -ne $fs) { $fs.Dispose() } }
+    }
+}
+
+function Write-CdtLogEntry {
+    # Full-Log erhaelt jeden Eintrag; ERROR-Eintraege zusaetzlich unveraendert ins Error-Log.
+    # Jede Datei einzeln: eine gesperrte Datei verhindert nicht das Schreiben der uebrigen.
+    param([string]$Level, [string]$Line, [string]$Json)
+    $targets = @(@{ Path = $Cdt.Log.Text; Json = $false }, @{ Path = $Cdt.Log.Json; Json = $true })
+    if ($Level -eq 'ERROR') {
+        $Cdt.Log.RunErrorCount = [int]$Cdt.Log.RunErrorCount + 1
+        $targets += @(@{ Path = $Cdt.Log.ErrorText; Json = $false }, @{ Path = $Cdt.Log.ErrorJson; Json = $true })
+    }
+    $failed = New-Object System.Collections.ArrayList
+    foreach ($t in $targets) {
+        try {
+            if ($t.Json) { Add-CdtJsonArrayItem -Path $t.Path -Json $Json }
+            else { Add-CdtFileContent -Path $t.Path -Text ($Line + "`r`n") -Utf8Bom $true }
+        }
+        catch { [void]$failed.Add(('{0}: {1}' -f (Split-Path -Leaf $t.Path), $_.Exception.Message)) }
+    }
+    if ($failed.Count -gt 0) { throw ($failed -join ' | ') }
+}
+
 function Write-CdtConsole {
     param([string]$Message)
     $m = Protect-CdtText -Text $Message
@@ -947,13 +1051,10 @@ function Write-CdtLog {
     if ($Recommendation) { [void]$parts.Add(('Empfehlung: {0}' -f (Protect-CdtText -Text $Recommendation))) }
     $line = ($parts -join ' | ')
     if ($null -ne $Cdt.Log -and $Cdt.Log.Ready) {
-        try {
-            Add-CdtFileContent -Path $Cdt.Log.Text -Text ($line + "`r`n") -Utf8Bom $true
-            Add-CdtFileContent -Path $Cdt.Log.Jsonl -Text ($json + "`n") -Utf8Bom $false
-        }
+        try { Write-CdtLogEntry -Level $Level -Line $line -Json $json }
         catch { Write-Host ('[DE-LANG] WARNUNG: Logeintrag konnte nicht geschrieben werden: {0}' -f $_.Exception.Message) }
     }
-    else { $CdtEarlyLog.Add(@{ Line = $line; Json = $json }) }
+    else { $CdtEarlyLog.Add(@{ Level = $Level; Line = $line; Json = $json }) }
     if ($Console -or $Level -eq 'ERROR') { Write-CdtConsole -Message $Message }
 }
 
@@ -977,23 +1078,36 @@ function Initialize-CdtLogging {
     $dateText = $Cdt.StartTime.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
     $base = '{0}_INSTALL-DE_{1}' -f $Cdt.VmName, $dateText
     $Cdt.Log = [ordered]@{
-        Root       = $root
-        StateDir   = (Join-Path $root 'state')
-        WorkDir    = (Join-Path $root 'work')
-        Text       = (Join-Path $root ($base + '.log'))
-        Jsonl      = (Join-Path $root ($base + '.jsonl'))
-        Summary    = (Join-Path $root ($base + '.summary.json'))
-        MissingTxt = (Join-Path $root 'missing-network-requirements.txt')
-        MissingCsv = (Join-Path $root 'missing-network-requirements.csv')
-        Ready      = $false
-        Error      = $null
+        Root           = $root
+        StateDir       = (Join-Path $root 'state')
+        WorkDir        = (Join-Path $root 'work')
+        Text           = (Join-Path $root ($base + '.log'))
+        Json           = (Join-Path $root ($base + '.json'))
+        ErrorText      = (Join-Path $root ($base + '.error.log'))
+        ErrorJson      = (Join-Path $root ($base + '.error.json'))
+        Summary        = (Join-Path $root ($base + '.summary.json'))
+        MissingTxt     = (Join-Path $root 'missing-network-requirements.txt')
+        MissingCsv     = (Join-Path $root 'missing-network-requirements.csv')
+        MissingWritten = $false
+        RunErrorCount  = 0
+        Ready          = $false
+        Error          = $null
     }
+    $notes = New-Object System.Collections.ArrayList
     try {
         foreach ($d in @($root, $Cdt.Log.StateDir)) {
             if (-not (Test-Path -LiteralPath $d -PathType Container)) { [void](New-Item -ItemType Directory -Path $d -Force) }
         }
         Add-CdtFileContent -Path $Cdt.Log.Text -Text '' -Utf8Bom $true
-        Add-CdtFileContent -Path $Cdt.Log.Jsonl -Text '' -Utf8Bom $false
+        # Unvollstaendige JSON-Logs (z. B. Abbruch waehrend des Schreibens) sichern statt fortschreiben
+        foreach ($jp in @($Cdt.Log.Json, $Cdt.Log.ErrorJson)) {
+            if ((Test-Path -LiteralPath $jp -PathType Leaf) -and -not (Test-CdtJsonArrayFile -Path $jp)) {
+                $bad = '{0}.corrupt-{1}' -f $jp, (Get-Date -Format 'yyyyMMddHHmmss')
+                Move-Item -LiteralPath $jp -Destination $bad -Force
+                [void]$notes.Add(('Unvollstaendiges JSON-Log gesichert als {0}; neue Datei begonnen.' -f $bad))
+            }
+        }
+        if (-not (Test-Path -LiteralPath $Cdt.Log.Json -PathType Leaf)) { [System.IO.File]::WriteAllText($Cdt.Log.Json, "[`r`n]`r`n", [System.Text.Encoding]::ASCII) }
         $probe = Join-Path $Cdt.Log.StateDir ('.writetest-' + $Cdt.RunId)
         [System.IO.File]::WriteAllText($probe, 'ok')
         Remove-Item -LiteralPath $probe -Force
@@ -1002,10 +1116,11 @@ function Initialize-CdtLogging {
     catch { $Cdt.Log.Error = (Get-CdtErrorInfo -InputObject $_).Message }
     if ($Cdt.Log.Ready) {
         foreach ($e in $CdtEarlyLog) {
-            Add-CdtFileContent -Path $Cdt.Log.Text -Text ($e.Line + "`r`n") -Utf8Bom $true
-            Add-CdtFileContent -Path $Cdt.Log.Jsonl -Text ($e.Json + "`n") -Utf8Bom $false
+            try { Write-CdtLogEntry -Level ([string]$e.Level) -Line $e.Line -Json $e.Json }
+            catch { Write-Host ('[DE-LANG] WARNUNG: Logeintrag konnte nicht geschrieben werden: {0}' -f $_.Exception.Message) }
         }
         $CdtEarlyLog.Clear()
+        foreach ($n in $notes) { Write-CdtLog -Level WARN -Phase 'Init' -Action 'Logging' -Message $n }
     }
     return [bool]$Cdt.Log.Ready
 }
@@ -2690,7 +2805,8 @@ function Invoke-CdtInstallation {
     if ($null -ne $res.WindowsUpdate) { foreach ($e in $res.WindowsUpdate.Errors) { [void]$errs.Add('WU: ' + $e) } }
     if ($null -ne $res.Fallback) { foreach ($e in $res.Fallback.Errors) { [void]$errs.Add('Fallback: ' + $e) } }
     $res.Errors = @($errs)
-    Write-CdtLog -Level $(if ($sat.Mandatory) { 'INFO' } else { 'ERROR' }) -Phase 'Install' -Action 'Result' -Message ('Installationsergebnis: {0} | Pflichtumfang erfuellt: {1}' -f (Get-CdtComponentSummaryText -State $state), $sat.Mandatory) -Console
+    Write-CdtLog -Level $(if ($sat.Mandatory) { 'INFO' } else { 'ERROR' }) -Phase 'Install' -Action 'Result' -Message ('Installationsergebnis: {0} | Pflichtumfang erfuellt: {1}' -f (Get-CdtComponentSummaryText -State $state), $sat.Mandatory) `
+        -ErrorMessage $(if ($sat.Mandatory) { '' } else { $res.Errors -join ' | ' }) -Console
     return $res
 }
 
@@ -2699,13 +2815,15 @@ function Invoke-CdtInstallation {
 # =====================================================================================================
 function New-CdtActionResult {
     param([string]$Name)
-    return [ordered]@{ Name = $Name; Status = 'NotRun'; Changed = $false; RebootRelevant = $false; Before = $null; After = $null; Message = ''; Error = $null }
+    return [ordered]@{ Name = $Name; Status = 'NotRun'; Changed = $false; RebootRelevant = $false; Before = $null; After = $null; Message = ''; Error = $null; Recovered = $false }
 }
 
 function Write-CdtActionResult {
     param([System.Collections.IDictionary]$Action)
+    # Failed ohne erfolgreichen Ausweichweg = Fehler; per Fallback behoben oder Blocked (bewusst nicht uebersteuert) = Warnung
     $level = 'INFO'
-    if (@('Failed', 'Blocked') -contains $Action.Status) { $level = 'WARN' }
+    if ($Action.Status -eq 'Failed' -and -not $Action.Recovered) { $level = 'ERROR' }
+    elseif (@('Failed', 'Blocked') -contains $Action.Status) { $level = 'WARN' }
     Write-CdtLog -Level $level -Phase 'Configure' -Action $Action.Name -Message ('{0}: {1} {2}' -f $Action.Name, $Action.Status, $Action.Message) -PreviousState ([string]$Action.Before) -ResultState ([string]$Action.After) `
         -Result $Action.Status -ErrorMessage ([string]$Action.Error) -Data $Action
 }
@@ -2983,7 +3101,9 @@ function Invoke-CdtConfiguration {
             $tBad = @($tCheck.Checks | Where-Object { ($_.Id -like 'W-*' -or $_.Id -like 'NU-*') -and $_.Blocking -and @('Fail', 'NotVerifiable') -contains $_.Status })
             if ($tBad.Count -gt 0) {
                 Write-CdtLog -Level WARN -Phase 'Configure' -Action 'CopyToSystem.Verify' -Message ('Uebernahme unvollstaendig ({0}) - Fallback intl.cpl' -f (($tBad | ForEach-Object { $_.Id }) -join ', ')) -Console
-                [void]$actions.Add((Copy-CdtSettingsToSystem -UseFallback))
+                $fb = Copy-CdtSettingsToSystem -UseFallback
+                [void]$actions.Add($fb)
+                if ($fb.Status -eq 'Applied') { $copy.Recovered = $true }
             }
         }
     }
@@ -3410,15 +3530,27 @@ function ConvertTo-CdtRequirementRow {
     return , ($rows.ToArray())
 }
 
-function Write-CdtNetworkRequirementFiles {
-    $current = @($Cdt.Network.Results)
-    $origin = 'Dieser Lauf'
-    $results = $current
-    if ($current.Count -eq 0 -and $null -ne $Cdt.State -and $null -ne $Cdt.State.network -and $null -ne $Cdt.State.network.lastCheck) {
-        $results = @($Cdt.State.network.lastCheck.results)
-        $origin = ('Letzte Pruefung: RunId {0} ({1})' -f $Cdt.State.network.lastCheck.runId, $Cdt.State.network.lastCheck.timeUtc)
+function Test-CdtOwnReportFile {
+    # Nur vom Script erzeugte Berichtsdateien (erkannt an der ersten Zeile) werden ersetzt/entfernt
+    param([string]$Path, [string]$FirstLine)
+    $sr = $null
+    try {
+        $sr = New-Object System.IO.StreamReader($Path, $true)
+        return ([string]$sr.ReadLine() -eq $FirstLine)
     }
+    catch { return $false }
+    finally { if ($null -ne $sr) { $sr.Dispose() } }
+}
+
+function Write-CdtNetworkRequirementFiles {
+    # Dateien NUR bei fehlenden Netzwerkvoraussetzungen (mind. eine erforderliche Verbindung fehlgeschlagen).
+    # Pruefung ohne Befund -> veraltete eigene Dateien entfernen; keine Pruefung in diesem Lauf -> nichts anfassen.
+    $results = @($Cdt.Network.Results)
+    $Cdt.Log.MissingWritten = $false
+    if ($results.Count -eq 0) { return }
     $header = @('URL/IP', 'Protokoll', 'Port/s', 'Richtung', 'Zweck', 'Gepruefte URL', 'Verbindungsziel (Proxy)', 'Aufgeloeste IPs (Diagnose, Zeitstempel UTC)', 'Pruefstatus', 'Fehlerkategorie', 'Fehlercode', 'Empfohlene Massnahme', 'Quelle der Anforderung', 'RunId', 'Zeitpunkt (UTC)')
+    $csvHeader = ConvertTo-CdtCsvLine -Values $header
+    $txtHeader = 'CDT-STANDARD-INSTALL-DE_LANG - fehlende Netzwerkanforderungen'
     $rows = New-Object System.Collections.ArrayList
     $notes = New-Object System.Collections.ArrayList
     foreach ($res in $results) {
@@ -3427,30 +3559,44 @@ function Write-CdtNetworkRequirementFiles {
         elseif (@('Fail', 'NotVerifiable', 'Warn') -contains $res.Status) { [void]$notes.Add(('{0} {1}:{2} -> {3} {4}: {5}' -f $res.Protocol, $res.Host, $res.Port, $res.Status, $res.Category, $res.Detail)) }
     }
     $now = Get-CdtUtcTimestamp
+    if ($null -ne $Cdt.State) {
+        $compact = @($results | ForEach-Object {
+                [ordered]@{ Id = $_.Id; Path = $_.Path; Host = $_.Host; Port = $_.Port; Protocol = $_.Protocol; Url = $_.Url; Required = $_.Required; Requirement = $_.Requirement; Purpose = $_.Purpose
+                    Reference = $_.Reference; ProxyMode = $_.ProxyMode; Proxy = $_.Proxy; ProxySource = $_.ProxySource; ConnectTarget = $_.ConnectTarget; Dns = $_.Dns; Status = $_.Status
+                    Category = $_.Category; Code = $_.Code; Detail = $_.Detail; Recommendation = $_.Recommendation; TimestampUtc = $_.TimestampUtc } })
+        $Cdt.State.network.lastCheck = [ordered]@{ runId = $Cdt.RunId; timeUtc = $now; results = $compact }
+    }
+    $own = @(@(@{ Path = $Cdt.Log.MissingTxt; First = $txtHeader }, @{ Path = $Cdt.Log.MissingCsv; First = $csvHeader }) | Where-Object { Test-Path -LiteralPath $_.Path -PathType Leaf })
+    if ($rows.Count -eq 0) {
+        $removed = New-Object System.Collections.ArrayList
+        foreach ($f in $own) {
+            if (Test-CdtOwnReportFile -Path $f.Path -FirstLine $f.First) { Remove-Item -LiteralPath $f.Path -Force -ErrorAction Stop; [void]$removed.Add((Split-Path -Leaf $f.Path)) }
+            else { Write-CdtLog -Level WARN -Phase 'Report' -Action 'NetworkFiles' -Message ('Fremde Datei gleichen Namens nicht veraendert: {0}' -f $f.Path) }
+        }
+        $msg = ('Netzwerkpruefung ({0} Ziele): keine fehlenden Netzwerkvoraussetzungen - keine missing-network-requirements-Datei.' -f $results.Count)
+        if ($removed.Count -gt 0) { $msg += (' Veraltete Datei(en) eines frueheren Laufs entfernt: {0}' -f ($removed -join ', ')) }
+        Write-CdtLog -Phase 'Report' -Action 'NetworkFiles' -Message $msg -Data ([ordered]@{ notes = @($notes) })
+        return
+    }
+    foreach ($f in $own) { if (-not (Test-CdtOwnReportFile -Path $f.Path -FirstLine $f.First)) { throw ('Fremde Datei gleichen Namens wird nicht ueberschrieben: {0}' -f $f.Path) } }
     $csv = New-Object System.Text.StringBuilder
-    [void]$csv.AppendLine((ConvertTo-CdtCsvLine -Values $header))
-    if ($rows.Count -gt 0) { foreach ($r in $rows) { [void]$csv.AppendLine((ConvertTo-CdtCsvLine -Values @($r.Url, $r.Protocol, $r.Ports, $r.Direction, $r.Purpose, $r.Checked, $r.Via, $r.Ips, $r.Status, $r.Category, $r.Code, $r.Action, $r.Reference, $r.RunId, $r.Time))) } }
-    elseif ($results.Count -gt 0) { [void]$csv.AppendLine((ConvertTo-CdtCsvLine -Values @('(keine)', '-', '-', '-', 'Statusmeldung', '-', '-', '-', 'KEINE_FEHLGESCHLAGENEN_ERFORDERLICHEN_VERBINDUNGEN', '-', '-', '-', $origin, $Cdt.RunId, $now))) }
-    else { [void]$csv.AppendLine((ConvertTo-CdtCsvLine -Values @('(keine)', '-', '-', '-', 'Statusmeldung', '-', '-', '-', 'NICHT_GEPRUEFT', '-', '-', 'In diesem Lauf war keine Netzwerkpruefung erforderlich', '-', $Cdt.RunId, $now))) }
+    [void]$csv.AppendLine($csvHeader)
+    foreach ($r in $rows) { [void]$csv.AppendLine((ConvertTo-CdtCsvLine -Values @($r.Url, $r.Protocol, $r.Ports, $r.Direction, $r.Purpose, $r.Checked, $r.Via, $r.Ips, $r.Status, $r.Category, $r.Code, $r.Action, $r.Reference, $r.RunId, $r.Time))) }
     $txt = New-Object System.Text.StringBuilder
-    [void]$txt.AppendLine('CDT-STANDARD-INSTALL-DE_LANG - fehlende Netzwerkanforderungen')
+    [void]$txt.AppendLine($txtHeader)
     [void]$txt.AppendLine(('Stand: {0} UTC | RunId: {1} | VM: {2} | Kontext: {3}' -f $now, $Cdt.RunId, $Cdt.VmName, $Cdt.Context.Identity))
-    [void]$txt.AppendLine(('Datenbasis: {0}' -f $origin))
     [void]$txt.AppendLine('Richtung aus Sicht der VM: ausgehend. Antwortverkehr laeuft ueber dieselbe Verbindung; keine eingehende Freigabe noetig.')
     [void]$txt.AppendLine('Freigaben auf DNS-Namen beziehen (Microsoft-CDN-IP-Adressen sind dynamisch; IPs nur als Diagnose).')
     [void]$txt.AppendLine('Ein fehlgeschlagener Zugriff ist nur dann ein Firewall-Befund, wenn die Kategorie das belegt (z. B. TCP-Timeout); DNS-, Proxy- und TLS-Befunde sind gesondert ausgewiesen.')
+    [void]$txt.AppendLine('Die Datei wird nur bei fehlenden Netzwerkvoraussetzungen geschrieben und nach einer erfolgreichen erneuten Pruefung entfernt.')
     [void]$txt.AppendLine('')
-    if ($rows.Count -gt 0) {
-        [void]$txt.AppendLine(('FEHLGESCHLAGENE ERFORDERLICHE VERBINDUNGEN: {0}' -f $rows.Count))
-        foreach ($r in $rows) {
-            [void]$txt.AppendLine(('- {0} | {1} | Port {2} | {3}' -f $r.Url, $r.Protocol, $r.Ports, $r.Purpose))
-            [void]$txt.AppendLine(('  Geprueft: {0} | Verbindungsziel: {1} | Kategorie: {2} {3}' -f $r.Checked, $r.Via, $r.Category, $r.Code))
-            [void]$txt.AppendLine(('  IPs (Diagnose): {0}' -f $r.Ips))
-            [void]$txt.AppendLine(('  Massnahme: {0}' -f $r.Action))
-        }
+    [void]$txt.AppendLine(('FEHLGESCHLAGENE ERFORDERLICHE VERBINDUNGEN: {0}' -f $rows.Count))
+    foreach ($r in $rows) {
+        [void]$txt.AppendLine(('- {0} | {1} | Port {2} | {3}' -f $r.Url, $r.Protocol, $r.Ports, $r.Purpose))
+        [void]$txt.AppendLine(('  Geprueft: {0} | Verbindungsziel: {1} | Kategorie: {2} {3}' -f $r.Checked, $r.Via, $r.Category, $r.Code))
+        [void]$txt.AppendLine(('  IPs (Diagnose): {0}' -f $r.Ips))
+        [void]$txt.AppendLine(('  Massnahme: {0}' -f $r.Action))
     }
-    elseif ($results.Count -gt 0) { [void]$txt.AppendLine('Derzeit wurden KEINE fehlgeschlagenen erforderlichen Netzwerkverbindungen festgestellt.') }
-    else { [void]$txt.AppendLine('In diesem Lauf war keine Netzwerkpruefung erforderlich; es liegen keine aktuellen Befunde vor. Historische Befunde: Tageslogs.') }
     if ($notes.Count -gt 0) {
         [void]$txt.AppendLine('')
         [void]$txt.AppendLine('HINWEISE (nicht als Pflichtverbindung eingestuft oder nicht zuverlaessig pruefbar):')
@@ -3462,13 +3608,8 @@ function Write-CdtNetworkRequirementFiles {
     [void]$txt.AppendLine('Tatsaechlicher Windows-Update-Zugriff ist nur durch den Installationsversuch nachweisbar (siehe Log, Phase Install).')
     Set-CdtFileContentAtomic -Path $Cdt.Log.MissingCsv -Text $csv.ToString() -Utf8Bom $true
     Set-CdtFileContentAtomic -Path $Cdt.Log.MissingTxt -Text $txt.ToString() -Utf8Bom $true
-    if ($current.Count -gt 0 -and $null -ne $Cdt.State) {
-        $compact = @($current | ForEach-Object {
-                [ordered]@{ Id = $_.Id; Path = $_.Path; Host = $_.Host; Port = $_.Port; Protocol = $_.Protocol; Url = $_.Url; Required = $_.Required; Requirement = $_.Requirement; Purpose = $_.Purpose
-                    Reference = $_.Reference; ProxyMode = $_.ProxyMode; Proxy = $_.Proxy; ProxySource = $_.ProxySource; ConnectTarget = $_.ConnectTarget; Dns = $_.Dns; Status = $_.Status
-                    Category = $_.Category; Code = $_.Code; Detail = $_.Detail; Recommendation = $_.Recommendation; TimestampUtc = $_.TimestampUtc } })
-        $Cdt.State.network.lastCheck = [ordered]@{ runId = $Cdt.RunId; timeUtc = $now; results = $compact }
-    }
+    $Cdt.Log.MissingWritten = $true
+    Write-CdtLog -Level WARN -Phase 'Report' -Action 'NetworkFiles' -Message ('{0} fehlende Netzwerkvoraussetzung(en) dokumentiert: {1}' -f $rows.Count, $Cdt.Log.MissingCsv) -Console
 }
 
 function New-CdtRunSummary {
@@ -3528,10 +3669,11 @@ function New-CdtRunSummary {
         openChecks         = $failedChecks
         warnings           = @($Cdt.Warnings) + $warnChecks
         errors             = @($Cdt.Errors)
-        network            = [ordered]@{ performed = [bool]$Cdt.Network.Performed; results = $net; missingRequirementsCsv = $Cdt.Log.MissingCsv }
+        network            = [ordered]@{ performed = [bool]$Cdt.Network.Performed; results = $net; missingRequirementsCsv = $(if ($Cdt.Log.MissingWritten) { $Cdt.Log.MissingCsv } else { $null }); missingRequirementsTxt = $(if ($Cdt.Log.MissingWritten) { $Cdt.Log.MissingTxt } else { $null }) }
         languageResources  = $Cdt.LanguageResources
         checks             = $checks
-        files              = [ordered]@{ log = $Cdt.Log.Text; jsonl = $Cdt.Log.Jsonl; summary = $Cdt.Log.Summary; state = $Cdt.StatePath }
+        errorCount         = [int]$Cdt.Log.RunErrorCount
+        files              = [ordered]@{ log = $Cdt.Log.Text; json = $Cdt.Log.Json; errorLog = $null; errorJson = $null; summary = $Cdt.Log.Summary; state = $Cdt.StatePath }
     }
 }
 
@@ -3580,9 +3722,11 @@ function Write-CdtConsoleSummary {
     foreach ($o in @($RunSummary.openChecks | Select-Object -First 6)) { Write-Host ('  offen: {0}' -f (Protect-CdtText -Text $o)) }
     if ($null -ne $Cdt.Network -and $Cdt.Network.Performed) {
         $failed = @($Cdt.Network.Results | Where-Object { $_.Status -eq 'Fail' -and $_.Required })
-        Write-Host ('Netzwerk: {0} Pruefungen, {1} erforderliche fehlgeschlagen -> {2}' -f @($Cdt.Network.Results).Count, $failed.Count, $Cdt.Log.MissingCsv)
+        if ($Cdt.Log.MissingWritten) { Write-Host ('Netzwerk: {0} Pruefungen, {1} erforderliche fehlgeschlagen -> {2}' -f @($Cdt.Network.Results).Count, $failed.Count, $Cdt.Log.MissingCsv) }
+        else { Write-Host ('Netzwerk: {0} Pruefungen, keine fehlenden Netzwerkvoraussetzungen' -f @($Cdt.Network.Results).Count) }
     }
-    Write-Host ('Logs: {0} (RunId {1})' -f $Cdt.Log.Text, $RunSummary.runId)
+    Write-Host ('Logs: {0} (+ .json) (RunId {1})' -f $Cdt.Log.Text, $RunSummary.runId)
+    if ($RunSummary.errorCount -gt 0) { Write-Host ('Fehler-Log: {0} (+ .json) - {1} Fehler in diesem Lauf' -f $Cdt.Log.ErrorText, $RunSummary.errorCount) }
     $line = ConvertTo-CdtJson -InputObject ([ordered]@{ product = $CdtProductName; version = $CdtScriptVersion; runId = $RunSummary.runId; mode = $RunSummary.mode; status = $RunSummary.status; exitCode = $RunSummary.exitCode; captureAllowed = $RunSummary.captureAllowed; verificationRun = $RunSummary.verificationRun; vm = $Cdt.VmName })
     Write-Host ('CDT_RESULT {0}' -f $line)
 }
@@ -3837,11 +3981,17 @@ function Complete-CdtRun {
         $Cdt.State.lastOutcome = [ordered]@{ runId = $Cdt.RunId; mode = $mode; status = $Cdt.Status; exitCode = $Cdt.ExitCode; timeUtc = (Get-CdtUtcTimestamp) }
     }
     if ($Cdt.Status -ne 'LOCKED') {
-        try { Write-CdtNetworkRequirementFiles } catch { Write-CdtLog -Level ERROR -Phase 'Report' -Action 'NetworkFiles' -Message 'missing-network-requirements konnte nicht geschrieben werden' -ErrorMessage (Get-CdtErrorInfo -InputObject $_).Message }
+        try { Write-CdtNetworkRequirementFiles } catch { Write-CdtLog -Level ERROR -Phase 'Report' -Action 'NetworkFiles' -Message 'missing-network-requirements konnte nicht aktualisiert werden' -ErrorMessage (Get-CdtErrorInfo -InputObject $_).Message }
     }
     if (-not $SkipState) { Save-CdtState }
     $summary = New-CdtRunSummary
-    Write-CdtLog -Level $(if ($Cdt.ExitCode -eq 0) { 'INFO' } else { 'ERROR' }) -Phase 'Result' -Action 'Final' -Message ('Ergebnis {0}, Exitcode {1}, Capture erlaubt {2}. {3}' -f $Cdt.Status, $Cdt.ExitCode, $Cdt.CaptureAllowed, $summary.nextStep) -Result $Cdt.Status -Recommendation $summary.nextStep -Data ([ordered]@{ statusReason = $Cdt.StatusReason; openChecks = $summary.openChecks })
+    # Abschlusszeile selbsterklaerend (auch im Error-Log): Ergebnis, Grund, offene Pruefungen; Empfehlung separat
+    $final = 'Ergebnis {0}, Exitcode {1}, Capture erlaubt {2}' -f $Cdt.Status, $Cdt.ExitCode, $Cdt.CaptureAllowed
+    if (-not [string]::IsNullOrEmpty([string]$Cdt.StatusReason)) { $final += ' | Grund: ' + $Cdt.StatusReason }
+    if (@($summary.openChecks).Count -gt 0) { $final += ' | Offen: ' + ((@($summary.openChecks) | Select-Object -First 8) -join '; ') }
+    Write-CdtLog -Level $(if ($Cdt.ExitCode -eq 0) { 'INFO' } else { 'ERROR' }) -Phase 'Result' -Action 'Final' -Message $final -Result $Cdt.Status -Recommendation $summary.nextStep -Data ([ordered]@{ statusReason = $Cdt.StatusReason; openChecks = $summary.openChecks })
+    $summary.errorCount = [int]$Cdt.Log.RunErrorCount
+    if ($summary.errorCount -gt 0) { $summary.files.errorLog = $Cdt.Log.ErrorText; $summary.files.errorJson = $Cdt.Log.ErrorJson }
     Write-CdtDailySummary -RunSummary $summary
     Write-CdtConsoleSummary -RunSummary $summary
 }

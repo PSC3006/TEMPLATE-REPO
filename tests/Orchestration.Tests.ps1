@@ -113,6 +113,11 @@ Describe 'Ablaufsimulation' {
         $r2.ExitCode | Should -Be 0
         $r2.Capture | Should -BeTrue
         (Read-CdtState).pendingVerification | Should -BeNullOrEmpty
+        # Fehlerfreie Laeufe: kein Error-Log, keine Netzwerkdatei; Full-Log (.json) enthaelt beide Laeufe
+        Test-Path -LiteralPath $Cdt.Log.ErrorText | Should -BeFalse
+        Test-Path -LiteralPath $Cdt.Log.ErrorJson | Should -BeFalse
+        Test-Path -LiteralPath $Cdt.Log.MissingCsv | Should -BeFalse
+        @([System.IO.File]::ReadAllText($Cdt.Log.Json) | ConvertFrom-Json | ForEach-Object { $_.runId } | Select-Object -Unique).Count | Should -Be 2
     }
 
     It 'Auto: Wiederholter Lauf im selben Boot aendert nichts und meldet weiter REBOOT_REQUIRED (Exit 0)' {
@@ -198,6 +203,13 @@ Describe 'Ablaufsimulation' {
         $r.Status | Should -Be 'FAILED'
         $r.Reason | Should -Match 'Pflichtkomponenten fehlen'
         [System.IO.File]::ReadAllText($Cdt.Log.Text) | Should -Match 'Keine geeignete Fallback-Quelle'
+        # Error-Log = exakt die ERROR-Zeilen des Full-Logs; Abschlusszeile mit Grund
+        $err = @([System.IO.File]::ReadAllLines($Cdt.Log.ErrorText) | Where-Object { $_ })
+        $err | Should -Be @([System.IO.File]::ReadAllLines($Cdt.Log.Text) | Where-Object { $_ -match '\[ERROR\]' })
+        $err[-1] | Should -Match '\[Result/Final\] Ergebnis FAILED, Exitcode 1.*Grund: Pflichtkomponenten fehlen'
+        $ej = @([System.IO.File]::ReadAllText($Cdt.Log.ErrorJson) | ConvertFrom-Json)
+        $ej.Count | Should -Be $err.Count
+        @($ej | Where-Object { $_.level -ne 'ERROR' }).Count | Should -Be 0
     }
 
     It 'Verify aendert nichts und meldet FAILED auf einem unkonfigurierten System' {
